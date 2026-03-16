@@ -1,0 +1,17 @@
+{
+  "name": "agent-spec",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "agents:init": "./.agents/scripts/init.sh",
+    "agents:init:force": "./.agents/scripts/init.sh --force",
+    "agents:init:dry": "./.agents/scripts/init.sh --dry-run",
+    "agents:clean": "./.agents/scripts/init.sh --clean",
+    "prepare": "./.agents/scripts/init.sh --quiet"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "packageManager": "pnpm@10.10.0"
+}

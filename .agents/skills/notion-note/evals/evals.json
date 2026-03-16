@@ -1,0 +1,23 @@
+{
+  "skill_name": "note-keeper",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "我刚发现 TypeScript 5.0 的 const type parameter 可以让泛型参数自动推断为字面量类型，不用再手动加 as const 了。帮我记一下",
+      "expected_output": "AI should extract the knowledge point about TypeScript 5.0 const type parameter, draft metadata (Title, Category=Frontend, Tags=[TypeScript, 泛型], Source=AI-Conversation, Importance=Medium), show a confirmation summary, and upon confirmation write the note to the Knowledge Base database in Notion.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "我的 Node.js 服务内存一直涨，最后发现是 EventEmitter 的 listener 没 removeListener，每次请求都注册了一个新的。加了 removeListener 之后就好了。",
+      "expected_output": "AI should proactively recognize this as a valuable debugging experience worth saving. It should suggest saving to the knowledge base with a concise prompt like '这个 EventEmitter 内存泄漏的排障经验值得记录到知识库，要我帮你保存吗？'. It should NOT just continue the conversation without offering to save.",
+      "files": []
+    },
+    {
+      "id": 3,
+      "prompt": "我之前记过一个 TypeScript 相关的笔记，帮我搜一下",
+      "expected_output": "AI should search the Knowledge Base database using keywords like 'TypeScript', present results in the specified scannable format (Title — Category | Tags | Date), and offer to show details of any specific note.",
+      "files": []
+    }
+  ]
+}
