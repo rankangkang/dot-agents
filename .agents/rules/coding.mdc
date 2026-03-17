@@ -1,0 +1,256 @@
+---
+globs: "**/*.{ts,tsx,js,jsx}"
+alwaysApply: false
+---
+
+# 编码规范
+
+## TypeScript
+
+### 类型安全
+
+- 禁止滥用 `any`；若确需绕过类型检查，优先使用 `unknown` 并做显式收窄，或添加注释说明原因
+- 禁止使用类型断言 `as SomeType` 绕过类型错误；若必须使用，需添加注释说明为何安全
+- 开启 `strict` 模式（`tsconfig.json` 中 `"strict": true`），不关闭严格检查选项
+
+### 类型定义
+
+- 优先使用 `interface` 定义对象结构，`type` 用于联合类型、交叉类型、工具类型等场景
+- 类型/接口命名使用 PascalCase，不加 `I` 前缀（如 `UserInfo` 而非 `IUserInfo`）
+- 枚举使用 `const enum` 或对象字面量 `as const`，避免使用普通 `enum`（会产生运行时代码）
+- 避免重复定义结构相似的类型，优先使用工具类型组合：`Partial`、`Required`、`Pick`、`Omit`、`Record` 等
+
+### 函数与返回值
+
+- 函数参数和返回值需有明确类型注解；回调函数、内联函数若类型可从上下文推断则无需显式标注
+- 异步函数返回 `Promise<T>`，明确泛型参数，避免返回 `Promise<any>`
+- 使用函数重载时，实现签名不对外暴露，重载签名需覆盖所有实际使用场景
+
+### 泛型
+
+- 泛型参数命名有语义时使用具体名称（如 `TItem`、`TKey`），单字母仅用于简单通用场景（`T`、`K`、`V`）
+- 避免不必要的泛型参数，只在真正需要复用类型关系时使用
+
+### 模块与导入
+
+- 不使用默认导出，使用命名导出
+- 类型导入使用 `import type { ... }`，与值导入分开，有助于 tree-shaking 和避免循环依赖
+- 路径别名按项目 `tsconfig.json` 配置使用，避免深层相对路径（`../../../`）
+- `index.(ts|js)` 作为重导出入口，不在其中声明业务逻辑
+
+### 异步与并发
+
+- 异步函数统一使用 `async/await`，避免混用 `.then()` 链和 await
+- 多个独立的异步操作使用 `Promise.all` / `Promise.allSettled` 并行执行，不逐个 await
+- 需要超时控制的操作使用 `AbortController` 或 `Promise.race` 配合超时 Promise
+- 避免在循环中 `await`，改用 `Promise.all(items.map(...))`；若需限流使用并发控制工具
+
+### 运行时校验
+
+- 外部输入（API 响应、用户输入、URL 参数、环境变量）在进入应用边界时做运行时校验
+- 推荐使用 Zod 等 schema 校验库，同时获得类型推断和运行时保障
+- 内部模块间传递的数据依赖编译时类型检查，无需运行时校验
+
+### 实用模式
+
+- 使用 `satisfies` 在保留字面类型的同时做类型检查：`const config = { ... } satisfies Config`
+- 使用 `as const` 替代 `enum`，获得更好的类型推断和 tree-shaking
+- 使用 `Readonly<T>` / `ReadonlyArray<T>` 标注不应被修改的数据结构
+- 使用 `Record<string, never>` 而非 `{}` 表示空对象类型
+
+## React
+
+### 组件规范
+
+- 使用函数组件 + TypeScript，不使用 class 组件
+- 组件文件使用 PascalCase 命名，如 `UserCard.tsx`
+- 每个文件只导出一个主组件；辅助子组件若仅在该文件内使用，可放在同一文件末尾
+- Props 类型使用 `interface` 定义并命名导出，命名规则为 `${ComponentName}Props`
+
+```tsx
+export interface UserCardProps {
+  name: string
+  avatar?: string
+  onClick?: () => void
+}
+
+export const UserCard = ({ name, avatar, onClick }: UserCardProps) => {
+  return (
+    <div onClick={onClick}>
+      {avatar && <img src={avatar} alt={name} />}
+      <span>{name}</span>
+    </div>
+  )
+}
+```
+
+### Hooks 规范
+
+- 自定义 Hook 文件使用 camelCase 命名，如 `useUserInfo.ts`
+- Hook 内部只放逻辑，返回值保持最小化，避免暴露内部实现细节
+- 副作用（`useEffect`）需明确依赖数组，禁止遗漏依赖项；若确需忽略，需添加注释说明原因
+- 状态更新函数若依赖当前 state，使用函数式更新：`setState(prev => prev + 1)`
+
+### 渲染与性能
+
+- 避免在 JSX 中内联定义函数或对象，提取到组件外或用 `useCallback` / `useMemo` 缓存
+- `React.memo` / `useMemo` / `useCallback` 仅在有明确性能瓶颈时使用，不提前优化
+- 列表渲染必须提供稳定、唯一的 `key`，禁止使用数组 index 作为 key（除非列表是静态且不会重排）
+- 长列表使用虚拟滚动（如 `@tanstack/react-virtual`），避免一次渲染数千 DOM 节点
+- 频繁触发的事件（scroll / resize / input）使用 debounce 或 throttle
+- 避免在父组件中定义内联对象/数组/函数作为子组件 props（每次渲染产生新引用）
+
+### 状态管理
+
+- 优先使用局部 state；跨组件共享状态先考虑 Context，复杂场景再引入状态管理库
+- 表单状态优先使用受控组件；复杂表单场景可使用项目已集成的表单库
+- 避免在 `useEffect` 中同步设置 state 造成额外渲染，优先在事件处理函数中更新
+- 服务端数据使用 React Query / SWR 等库管理缓存，避免重复请求
+- 状态下沉：将状态放置在最近的需要它的组件层级，避免不必要的全局状态
+
+### 条件渲染
+
+- 使用 `&&` 渲染可选节点时，确保左侧为布尔值，避免渲染数字 `0`
+- 复杂条件分支提取为独立组件或变量，避免在 JSX 中嵌套多层三目运算符
+
+### 组件设计模式
+
+- **组合优于继承**：通过 children、render props 或自定义 hooks 实现组件复用，不使用 HOC 嵌套
+- **关注点分离**：将数据获取逻辑放入自定义 Hook，组件只负责渲染
+- **受控与非受控**：对外暴露的组件优先设计为受控模式，支持 `value` + `onChange` 模式
+- **合理拆分**：单个组件文件不超过 200 行；超出时按职责拆分为子组件或提取 Hook
+
+### 副作用与数据获取
+
+- 数据获取使用专门的库（如 React Query / SWR）管理缓存和状态，避免在 `useEffect` 中手动 fetch
+- 清理副作用：`useEffect` 中涉及订阅、定时器、DOM 监听器的操作必须在返回函数中清理
+- 避免在 `useEffect` 中链式调用多个 setState，优先使用 `useReducer` 管理复合状态
+
+### 安全
+
+- 禁止使用 `dangerouslySetInnerHTML`，除非内容完全可信并经过 sanitize 处理
+- URL 类 props（`href`、`src`）必须校验协议，防止 `javascript:` 注入
+- 前端不存储敏感信息到 `localStorage`；必要时使用 HttpOnly Cookie
+
+### 可访问性
+
+- 使用语义化 HTML 标签（`<header>`、`<nav>`、`<main>`、`<button>` 等），减少无意义的 `<div>` 堆叠
+- 表单控件必须有关联的 `<label>`；必填字段使用 `required` 属性
+- 所有交互元素可通过键盘操作；模态框实施焦点陷阱
+- 有意义的图片提供描述性 `alt` 文本；图标按钮无可见文本时提供 `aria-label`
+- 优先使用原生 HTML 语义，ARIA 仅在原生语义无法满足时补充
+- 尊重用户偏好：`prefers-reduced-motion`、`prefers-color-scheme`
+
+### 可测试性
+
+- 关键交互元素（按钮、表单、列表项等）添加 `data-testid` 属性，便于 E2E 和集成测试定位
+- `data-testid` 命名使用 kebab-case，格式为 `<模块>-<元素>[-<状态/变体>]`，如 `user-list-item`、`login-submit-btn`、`modal-close`
+- 仅在无法通过语义化方式（`getByRole`、`getByText`、`getByLabelText`）稳定定位时添加 `data-testid`，避免滥用
+- 组件对外暴露的 props 支持透传 `data-testid`，便于上层测试定位内部元素
+- 生产构建可通过 babel/vite 插件移除 `data-testid` 属性，避免增加 DOM 体积
+
+## 错误处理与日志
+
+### 错误分类
+
+| 类型 | 特征 | 处理策略 |
+|---|---|---|
+| 可预期业务错误 | 用户输入非法、资源不存在、权限不足 | 返回 Result / 状态码，不 throw |
+| 外部服务异常 | API 超时、网络错误、第三方服务不可用 | catch + 重试/降级 + 日志上报 |
+| 编程错误 | 类型断言失败、不可达分支、空引用 | throw + 快速失败 + 告警 |
+
+### 错误处理原则
+
+- **就近处理**：在最接近错误发生点的位置处理，避免错误在调用链中无谓冒泡
+- **不吞没错误**：禁止空 catch 块；若确需忽略某错误，必须注释说明原因
+- **错误信息完整**：错误消息应包含上下文（操作名称、关键参数），帮助定位问题
+- **层级转换**：跨层传递时将底层错误包装为当前层的领域错误，保留原始错误作为 `cause`
+- catch 块中的 `error` 类型为 `unknown`，必须做类型收窄后再访问属性
+
+### Result 模式
+
+可预期的失败优先使用 Result 模式返回，而非 throw。两种常见风格：
+
+**Discriminated Union 风格：**
+
+```ts
+type Result<T, E = Error> =
+  | { ok: true; value: T }
+  | { ok: false; error: E }
+
+const ok = <T>(value: T): Result<T, never> => ({ ok: true, value })
+const err = <E>(error: E): Result<never, E> => ({ ok: false, error })
+
+const result = await createUser(input)
+if (!result.ok) {
+  return handleError(result.error)
+}
+doSomething(result.value)
+```
+
+**Tuple 风格（Go-like）：**
+
+```ts
+type GoResult<T, E = Error> = [T, null] | [null, E]
+
+async function fetchUser(id: string): Promise<GoResult<User>> {
+  try {
+    const user = await db.findUser(id)
+    return [user, null]
+  } catch (error) {
+    return [null, error instanceof Error ? error : new Error(String(error))]
+  }
+}
+
+const [user, err] = await fetchUser(id)
+if (err) {
+  return handleError(err)
+}
+doSomething(user)
+```
+
+两种风格均可，项目内保持统一即可。Tuple 风格更轻量，Discriminated Union 风格类型推断更精确。
+
+### 自定义错误
+
+不可恢复的编程错误使用 throw + 自定义 Error 类：
+
+```ts
+class AppError extends Error {
+  constructor(
+    message: string,
+    public readonly code: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options)
+    this.name = 'AppError'
+  }
+}
+
+try {
+  await db.query(sql)
+} catch (error) {
+  throw new AppError('Failed to fetch user', 'USER_FETCH_ERROR', { cause: error })
+}
+```
+
+### 前端错误处理
+
+- 全局未捕获异常：注册 `window.onerror` 和 `window.onunhandledrejection` 作为兜底
+- 组件级：使用 React Error Boundary 捕获渲染错误，提供降级 UI
+- 请求层：在 HTTP client 统一处理通用错误码（401/403/500）
+- 用户反馈：错误应转化为用户可理解的提示，不暴露技术细节
+
+### 日志规范
+
+| 级别 | 使用场景 |
+|---|---|
+| `error` | 需要立即关注的错误，影响用户或数据完整性 |
+| `warn` | 潜在问题，暂不影响功能但需关注 |
+| `info` | 重要业务事件（启动、关键操作完成、外部调用） |
+| `debug` | 开发调试信息，生产环境默认关闭 |
+
+- 结构化日志：使用 JSON 格式输出，包含 `timestamp`、`level`、`message`、`context` 字段
+- 禁止在日志中输出敏感信息（密码、token、身份证号等）
+- 生产代码禁止提交 `console.log`；使用项目统一的 logger 实例
+- 关键操作（用户登录、支付、数据变更）必须记录审计日志

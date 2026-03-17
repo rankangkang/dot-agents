@@ -1,0 +1,172 @@
+---
+alwaysApply: true
+---
+
+# 项目工程规范
+
+## 代码组织
+
+### 目录结构
+
+一个完整的项目/代码模块，可能包含以下目录：
+
+- `modules`：组织多个业务模块，各模块可拥有自己的组件、接口、类型、常量、配置等
+- `utils`：可复用的工具代码，通常业务无关
+- `types`：可复用的类型定义
+- `constants`：可复用的常量定义
+- `config`：可复用的配置文件
+- `helpers`：可复用的辅助函数，通常业务相关
+- `components`：可复用的组件代码
+- `(pages|views)`：页面代码
+- `tests`：测试代码
+- `scripts`：构建、打包等脚本
+- `assets`：资源文件（图片、字体、SVG 等），统一存放，避免零散在业务目录
+- `styles`：全局样式文件；模块级样式随模块存放
+
+若一个目录下只需一个文件，可将文件夹退化为文件（如 `types/` → `types.ts`）。满足以下任一条件时可退化：
+
+- 仅包含单一文件且短期无扩展计划
+- 新增资源少于 3 个且与父目录语义高度一致
+- 目录会导致导入路径冗长
+
+若后续需要扩展，再将文件拆分回独立目录，并在一次提交中完成迁移。
+
+### 文件命名
+
+**前端**：组件/页面使用 PascalCase（`MyComponent.tsx`），其余使用 camelCase（`myFunction.ts`）
+
+**服务端**：使用 kebab-case（`my-service.ts`、`auth-middleware.ts`）
+
+**跨端**：共享类型、常量、配置优先放在 `shared` 或 `modules/*/types.ts`；同名模块在前后端共存时，在目录级区分（如 `web/modules/auth`、`api/modules/auth`）。
+
+## 测试规范
+
+### 测试策略
+
+采用"实现后补测试，关键路径必测"策略：
+
+**必须测试**：核心业务逻辑、复杂计算/转换函数、公共工具函数和 Hooks、Bug 修复（先写回归测试）、边界条件和错误路径
+
+**可选测试**：简单 CRUD 组件、第三方库的薄封装、临时性/实验性代码
+
+### 测试金字塔
+
+```
+    /  E2E  \         — 少量：核心用户旅程
+   / 集成测试 \       — 适量：模块间协作、API 路由
+  /  单元测试  \      — 大量：纯函数、工具函数、Hooks
+```
+
+### 命名与结构
+
+- 测试文件与被测文件同名，后缀为 `.spec.ts` / `.spec.tsx`
+- 放置在被测文件同级的 `__tests__/` 目录或同目录下
+- 用例命名使用 `describe` + `it`/`test`，模板：`should <expected behavior> when <condition>`
+
+### 编写原则
+
+**AAA 模式（Arrange → Act → Assert）：**
+
+```ts
+it('should merge user preferences', () => {
+  // Arrange
+  const defaults = { theme: 'light', lang: 'en' }
+  const overrides = { theme: 'dark' }
+
+  // Act
+  const result = mergePreferences(defaults, overrides)
+
+  // Assert
+  expect(result).toEqual({ theme: 'dark', lang: 'en' })
+})
+```
+
+- **独立性**：每个用例独立运行，不依赖执行顺序或共享可变状态
+- **确定性**：相同输入始终产生相同结果；避免依赖时间、随机数、网络
+- **一个断言焦点**：每个 `it` 块验证一个行为点
+- **不测试实现**：测试行为和结果，不测试内部实现细节
+
+### Mock 规范
+
+- 只 mock 外部依赖（API 请求、数据库、第三方服务），不 mock 被测模块内部逻辑
+- Mock 数据使用工厂函数生成，避免硬编码
+- 每个测试结束后清理 mock（`vi.restoreAllMocks()`）
+- 优先使用 `vi.fn()` / `jest.fn()` 而非完整的模块 mock
+
+### 覆盖率
+
+- 核心业务模块 ≥ 80%（行覆盖 + 分支覆盖）
+- 工具/公共模块 ≥ 90%
+- 不追求 100%；关注有意义的覆盖而非数字
+
+## 安全与环境配置
+
+- 敏感配置（密钥、密码、Token、数据库连接串）通过环境变量注入，绝对禁止硬编码或提交到版本控制
+- 提供 `.env.example` 列出所有必需变量及说明，不含实际值；`.env` 必须在 `.gitignore` 中
+- 应用启动时校验必需环境变量，缺失时快速失败并给出明确提示
+- 按环境分层管理配置：`development` → `staging` → `production`
+- 使用统一的配置读取模块，避免在业务代码中直接读取 `process.env`
+- 定期运行 `npm audit` 检查已知漏洞；谨慎引入维护不活跃或 star 数极低的第三方包
+
+## 依赖管理
+
+### 引入原则
+
+- 引入新依赖前需评估：包体积、周下载量、最近更新时间、开源许可证（优先 MIT/Apache-2.0）
+- 优先使用项目已有依赖能力，避免功能重叠的包共存
+- 能用原生 API 实现的功能，不额外引入依赖
+
+### 版本策略
+
+- `dependencies` 使用精确版本或 `^` 范围；`devDependencies` 可使用 `^` 范围
+- 定期审查并升级依赖，关注 breaking changes 和安全公告
+- `peerDependencies` 应明确声明版本范围
+
+### 锁文件
+
+- 必须提交 lock 文件，确保团队和 CI 环境一致
+- 变更依赖后检查 lock 文件差异，确认无意外的间接依赖升级
+
+## Git 工作流
+
+### Commit 规范 (Conventional Commits)
+
+格式：`<type>(<scope>): <subject>`
+
+| Type | 说明 | 示例 |
+|---|---|---|
+| `feat` | 新功能 | `feat(auth): add OAuth2 login` |
+| `fix` | 修复 Bug | `fix(cart): correct total calculation` |
+| `docs` | 文档变更 | `docs(api): update endpoint description` |
+| `style` | 格式调整（不影响逻辑） | `style: fix indentation` |
+| `refactor` | 重构 | `refactor(user): extract validation logic` |
+| `perf` | 性能优化 | `perf(list): virtualize long list rendering` |
+| `test` | 测试相关 | `test(auth): add login flow tests` |
+| `chore` | 构建/工具/依赖变更 | `chore: upgrade TypeScript to 5.7` |
+| `ci` | CI/CD 配置变更 | `ci: add staging deploy workflow` |
+| `revert` | 回退提交 | `revert: revert feat(auth) commit abc123` |
+
+- Subject 使用英文，首字母小写，祈使语气，不超过 72 字符
+- Body 解释 **Why** 而非 What，每行不超过 100 字符
+- Breaking Changes 使用 `BREAKING CHANGE:` 前缀；关联 Issue 使用 `Closes #123`
+
+### 分支策略
+
+命名格式：`<type>/<brief-description>`（如 `feat/user-auth`、`fix/cart-total`）
+
+- `main` / `master`：生产分支，始终保持可部署状态
+- 功能分支从 `main` 拉出，完成后通过 PR 合并
+- 合并后删除源分支，保持分支列表整洁
+
+### Pull Request 规范
+
+- PR 标题遵循 Conventional Commits 格式
+- 简述变更目的和方案，列出关键改动点，标注影响范围和风险
+- 单个 PR 聚焦一个功能/修复，行数建议控制在 400 行以内
+- 合并前需通过 CI 检查；优先使用 Squash Merge
+
+### 其他 Git 约定
+
+- `.gitignore` 必须包含：IDE 配置、OS 文件、`node_modules`、`.env`、构建产物
+- 不提交大型二进制文件（>1MB）；使用 Git LFS 或外部存储
+- Commit 前确保代码可编译、lint 通过，借助 pre-commit hook 自动化
