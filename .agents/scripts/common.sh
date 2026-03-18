@@ -140,6 +140,11 @@ discover_asset_types() {
         for subdir in "$dir"*/; do
             [[ -d "$subdir" ]] && { has_content=true; break; }
         done
+        if ! $has_content; then
+            for file in "$dir"*; do
+                [[ -f "$file" ]] && [[ "$(basename "$file")" != .* ]] && { has_content=true; break; }
+            done
+        fi
         $has_content && types+=("$name")
     done
 
@@ -329,6 +334,13 @@ init_links() {
     for item_path in "$source_dir"/*/; do
         [[ ! -d "$item_path" ]] && continue
         items+=("$(basename "$item_path")")
+    done
+    for item_path in "$source_dir"/*; do
+        [[ ! -f "$item_path" ]] && continue
+        local fname
+        fname=$(basename "$item_path")
+        [[ "$fname" == .* ]] && continue
+        items+=("$fname")
     done
 
     if [[ ${#items[@]} -eq 0 ]]; then
