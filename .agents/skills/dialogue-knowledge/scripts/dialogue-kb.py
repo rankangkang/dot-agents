@@ -9,7 +9,11 @@
   dialogue-kb collect [--remote HOST...]   同步远程对话到本地归档
   dialogue-kb index                        解析对话并构建索引
   dialogue-kb list   [--source X] [QUERY]  列出/搜索对话
-  dialogue-kb show   <ID>                  查看对话详情
+  dialogue-kb show   <ID> [--full]         查看对话详情
+  dialogue-kb triage                       输出待提炼摘要(JSON)
+  dialogue-kb done   <ID...>               标记为已提炼（支持批量）
+  dialogue-kb skip   <ID...>               标记为跳过（支持批量）
+  dialogue-kb reset  <ID...>               重置状态为 pending
   dialogue-kb stats                        显示统计信息
 
 纯 Python 标准库实现，零依赖。
@@ -25,7 +29,7 @@ import re
 import shlex
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -85,6 +89,12 @@ def cyan(t):   return _c("36", t)
 def dim(t):    return _c("2", t)
 def red(t):    return _c("31", t)
 def bold(t):   return _c("1", t)
+
+_verbose = False
+
+def _warn(msg: str):
+    if _verbose:
+        print(f"  {dim(f'[warn] {msg}')}", file=sys.stderr)
 
 
 # ═══════════════════════════════════════
@@ -249,8 +259,8 @@ def scan_local() -> dict:
                         "path": hist_dir,
                     })
                     result["total_files"] += session_count
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"scan codebuddy-ide {cb_base}: {e}")
 
     return result
 
@@ -411,8 +421,8 @@ def collect_local(archive_dir: Path) -> list[dict]:
                             "file": conv_dir.name,
                             "source": str(conv_dir),
                         })
-        except Exception:
-            pass
+        except Exception as e:
+            _warn(f"collect codebuddy-ide {cb_base}: {e}")
 
     return results
 
@@ -560,6 +570,10 @@ def parse_cursor_jsonl(filepath: Path) -> dict | None:
         return None
 
     session_id = filepath.stem
+    try:
+        file_ts = datetime.fromtimestamp(filepath.stat().st_mtime, tz=timezone.utc).isoformat()
+    except Exception:
+        file_ts = None
     return {
         "id": session_id,
         "source": "cursor",
@@ -569,6 +583,7 @@ def parse_cursor_jsonl(filepath: Path) -> dict | None:
         "turn_count": len(turns),
         "user_turns": sum(1 for t in turns if t["role"] == "user"),
         "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
+        "timestamp": file_ts,
         "turns": turns,
     }
 
@@ -922,6 +937,48 @@ def _apply_distill_state(entry: dict, old: dict | None, new_turn_count: int):
         entry["distilled_at"] = old["distilled_at"]
     if old.get("note_file"):
         entry["note_file"] = old["note_file"]
+    if old.get("channels"):
+        entry["channels"] = old["channels"]
+    if old.get("note_title"):
+        entry["note_title"] = old["note_title"]
+    if old.get("skip_reason"):
+        entry["skip_reason"] = old["skip_reason"]
+
+
+# 用于快速判断对话是否为系统/命令消息的模式
+_COMMAND_TITLE_RE = re.compile(
+    r"^(/model|/plugin|/help|/config|/quit|/exit|resume$|<local-command|<command-)",
+    re.I,
+)
+
+
+def _compute_worth(entry: dict) -> str:
+    """基于客观指标预过滤，只做脚本能确定的判断。
+
+    返回:
+      "auto_skip"  — 确定无价值（太短 / 无回复 / 纯命令）
+      "normal"     — 需要 AI 判断（脚本无法确定价值）
+
+    内容相关的价值判断（标题关键词、对话质量等）交给 AI 在 triage 阶段做。
+    """
+    turns = entry.get("turn_count", 0)
+    user_turns = entry.get("user_turns", 0)
+    asst_turns = entry.get("assistant_turns", 0)
+    title = entry.get("title", "")
+    first_q = entry.get("first_question", "")
+
+    if turns < 2:
+        return "auto_skip"
+    if asst_turns == 0:
+        return "auto_skip"
+    if user_turns == 0:
+        return "auto_skip"
+    if _COMMAND_TITLE_RE.match(first_q):
+        return "auto_skip"
+    if title in ("Untitled", "") and turns < 4:
+        return "auto_skip"
+
+    return "normal"
 
 
 def build_index(archive_dir: Path) -> dict:
@@ -1011,6 +1068,10 @@ def build_index(archive_dir: Path) -> dict:
             entry["cwd"] = parsed["cwd"]
 
         _apply_distill_state(entry, old, parsed["turn_count"])
+        entry["worth"] = _compute_worth(entry)
+        if entry["worth"] == "auto_skip" and entry.get("distill_state") == "pending":
+            entry["distill_state"] = "skipped"
+            entry["skip_reason"] = "auto: too short or system command"
         stats["updated" if old else "new"] += 1
         conversations.append(entry)
 
@@ -1061,8 +1122,20 @@ def build_index(archive_dir: Path) -> dict:
                     entry["timestamp"] = parsed["timestamp"]
 
                 _apply_distill_state(entry, old, parsed["turn_count"])
+                entry["worth"] = _compute_worth(entry)
+                if entry["worth"] == "auto_skip" and entry.get("distill_state") == "pending":
+                    entry["distill_state"] = "skipped"
+                    entry["skip_reason"] = "auto: too short or system command"
                 stats["updated" if old else "new"] += 1
                 conversations.append(entry)
+
+    # 对于缓存命中的旧条目，如果还没有 worth 字段，补算一次
+    for conv in conversations:
+        if "worth" not in conv:
+            conv["worth"] = _compute_worth(conv)
+            if conv["worth"] == "auto_skip" and conv.get("distill_state") == "pending":
+                conv["distill_state"] = "skipped"
+                conv["skip_reason"] = "auto: too short or system command"
 
     # 统计被删除的条目
     stats["removed"] = len(set(old_entries.keys()) - seen_ids)
@@ -1240,6 +1313,30 @@ def cmd_list(args):
         conversations = [c for c in conversations if c.get("tool") == args.source]
     if args.host:
         conversations = [c for c in conversations if c.get("host") == args.host]
+    if args.state:
+        conversations = [c for c in conversations if c.get("distill_state") == args.state]
+    if args.pending:
+        conversations = [c for c in conversations
+                         if c.get("distill_state") in ("pending", "outdated")]
+
+    # 时间过滤
+    since_dt = None
+    if getattr(args, 'since', None):
+        try:
+            since_dt = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+        except ValueError:
+            print(red(f"无效日期格式: {args.since}，请用 YYYY-MM-DD"))
+            return
+    elif getattr(args, 'days', None):
+        since_dt = datetime.now(timezone.utc) - timedelta(days=args.days)
+
+    if since_dt:
+        since_iso = since_dt.isoformat()
+        conversations = [
+            c for c in conversations
+            if (c.get("timestamp") or "") >= since_iso
+        ]
+
     if args.query:
         q = args.query.lower()
         conversations = [
@@ -1252,14 +1349,24 @@ def cmd_list(args):
         print(dim("未找到匹配的对话"))
         return
 
-    # 显示
+    # 分页
+    total_count = len(conversations)
+    offset = getattr(args, 'offset', 0) or 0
     limit = args.limit or 20
-    for i, conv in enumerate(conversations[:limit]):
-        idx = dim(f"[{i+1}]")
+    page = conversations[offset:offset + limit]
+
+    if not page:
+        print(dim(f"偏移 {offset} 超出范围（共 {total_count} 条）"))
+        return
+
+    for i, conv in enumerate(page):
+        display_idx = offset + i + 1
+        idx = dim(f"[{display_idx}]")
         tool = _tool_display(conv.get("tool", "?"))
         title = conv.get("title", "Untitled")
         turns = dim(f"({conv.get('turn_count', '?')} turns)")
         host = dim(f"@{conv.get('host', '?')}")
+
         state = conv.get("distill_state", "")
         state_tag = ""
         if state == "done":
@@ -1272,8 +1379,9 @@ def cmd_list(args):
 
         print(f"  {idx} {tool} {bold(title)} {turns} {host}{state_tag}")
 
-    if len(conversations) > limit:
-        print(f"\n  {dim(f'... 共 {len(conversations)} 条，已显示前 {limit} 条')}")
+    if offset + limit < total_count:
+        next_offset = offset + limit
+        print(f"\n  {dim(f'共 {total_count} 条，当前 {offset+1}-{offset+len(page)}。下一页: --offset {next_offset}')}")
 
 
 def cmd_show(args):
@@ -1327,12 +1435,13 @@ def cmd_show(args):
     print(f"  {_tool_display(tool)} | {dim(conv.get('host', '?'))} | {parsed['turn_count']} turns")
     print(bold(f"{'═' * 60}\n"))
 
+    full_mode = getattr(args, 'full', False)
     for turn in parsed["turns"]:
         role_label = green("  User") if turn["role"] == "user" else blue("  AI")
         print(f"{role_label}:")
         text = turn["text"]
-        if len(text) > 2000:
-            text = text[:1000] + f"\n{dim('... [truncated] ...')}\n" + text[-500:]
+        if not full_mode and len(text) > 2000:
+            text = text[:1000] + f"\n{dim('... [truncated, use --full to see all] ...')}\n" + text[-500:]
         for line in text.split("\n"):
             print(f"    {line}")
         print()
@@ -1397,6 +1506,46 @@ def cmd_stats(args):
     print()
 
 
+def cmd_triage(args):
+    """输出待提炼对话的摘要，供 AI 批量判值。
+
+    输出紧凑的 JSON 数组，每条包含 id、title、first_question、turn_count、tool、host，
+    方便 AI 一次性扫描并决定哪些值得深入阅读。
+    """
+    archive_dir = Path(args.archive_dir)
+    index_path = archive_dir / INDEX_FILE
+
+    if not index_path.exists():
+        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+        return
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    conversations = index.get("conversations", [])
+
+    pending = [c for c in conversations
+               if c.get("distill_state") in ("pending", "outdated")]
+
+    if not pending:
+        print(json.dumps({"pending": 0, "items": []}, ensure_ascii=False))
+        return
+
+    items = []
+    for c in pending:
+        items.append({
+            "id": c["id"],
+            "idx": conversations.index(c) + 1,
+            "title": c.get("title", "")[:100],
+            "first_question": c.get("first_question", "")[:150],
+            "turns": c.get("turn_count", 0),
+            "tool": c.get("tool", ""),
+            "host": c.get("host", ""),
+            "state": c.get("distill_state", ""),
+        })
+
+    result = {"pending": len(items), "items": items}
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+
+
 def _tool_display(tool: str) -> str:
     labels = {
         "cursor": cyan("▶ Cursor"),
@@ -1406,6 +1555,133 @@ def _tool_display(tool: str) -> str:
         "codebuddy-ide": yellow("★ CodeBuddy IDE"),
     }
     return labels.get(tool, tool)
+
+
+# ═══════════════════════════════════════
+# 提炼状态管理
+# ═══════════════════════════════════════
+
+def _update_index_entries(archive_dir: Path, updates_map: dict[str, dict]) -> list[str]:
+    """批量更新 index.json 中多条对话的字段。返回成功更新的 ID 列表。"""
+    index_path = archive_dir / INDEX_FILE
+    if not index_path.exists():
+        return []
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    updated = []
+    for conv in index["conversations"]:
+        if conv["id"] in updates_map:
+            conv.update(updates_map[conv["id"]])
+            updated.append(conv["id"])
+
+    if updated:
+        index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    return updated
+
+
+def cmd_done(args):
+    """标记对话为已提炼（支持批量）。"""
+    archive_dir = Path(args.archive_dir)
+    conv_ids = _resolve_conv_ids(archive_dir, args.ids)
+    if not conv_ids:
+        print(red(f"未找到对话: {', '.join(args.ids)}"))
+        return
+
+    channels = [c.strip() for c in args.channels.split(",")] if args.channels else []
+    now = datetime.now(timezone.utc).isoformat()
+    updates_map = {}
+    for cid in conv_ids:
+        entry_updates = {
+            "distill_state": "done",
+            "distilled_at": now,
+        }
+        if channels:
+            entry_updates["channels"] = channels
+        if args.note_title:
+            entry_updates["note_title"] = args.note_title
+        updates_map[cid] = entry_updates
+
+    updated = _update_index_entries(archive_dir, updates_map)
+    ch_info = f" → {', '.join(channels)}" if channels else ""
+    for cid in updated:
+        print(green(f"✔ done: {cid}{ch_info}"))
+    failed = set(conv_ids) - set(updated)
+    for cid in failed:
+        print(red(f"更新失败: {cid}"))
+
+
+def cmd_skip(args):
+    """标记对话为跳过（支持批量）。"""
+    archive_dir = Path(args.archive_dir)
+    conv_ids = _resolve_conv_ids(archive_dir, args.ids)
+    if not conv_ids:
+        print(red(f"未找到对话: {', '.join(args.ids)}"))
+        return
+
+    now = datetime.now(timezone.utc).isoformat()
+    updates_map = {}
+    for cid in conv_ids:
+        entry_updates = {
+            "distill_state": "skipped",
+            "distilled_at": now,
+        }
+        if args.reason:
+            entry_updates["skip_reason"] = args.reason
+        updates_map[cid] = entry_updates
+
+    updated = _update_index_entries(archive_dir, updates_map)
+    for cid in updated:
+        print(dim(f"⊘ skipped: {cid}"))
+    failed = set(conv_ids) - set(updated)
+    for cid in failed:
+        print(red(f"更新失败: {cid}"))
+
+
+def cmd_reset(args):
+    """重置对话状态为 pending（支持批量）。"""
+    archive_dir = Path(args.archive_dir)
+    conv_ids = _resolve_conv_ids(archive_dir, args.ids)
+    if not conv_ids:
+        print(red(f"未找到对话: {', '.join(args.ids)}"))
+        return
+
+    updates_map = {}
+    for cid in conv_ids:
+        updates_map[cid] = {
+            "distill_state": "pending",
+            "distilled_at": None,
+            "skip_reason": None,
+            "channels": None,
+            "note_title": None,
+        }
+
+    updated = _update_index_entries(archive_dir, updates_map)
+    for cid in updated:
+        print(yellow(f"↺ reset to pending: {cid}"))
+    failed = set(conv_ids) - set(updated)
+    for cid in failed:
+        print(red(f"更新失败: {cid}"))
+
+
+def _resolve_conv_ids(archive_dir: Path, targets: list[str]) -> list[str]:
+    """将多个编号或 ID 批量解析为 conv_id 列表。"""
+    index_path = archive_dir / INDEX_FILE
+    if not index_path.exists():
+        return []
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    conversations = index.get("conversations", [])
+    all_ids = {c["id"] for c in conversations}
+
+    resolved = []
+    for target in targets:
+        if target.isdigit():
+            idx = int(target) - 1
+            if 0 <= idx < len(conversations):
+                resolved.append(conversations[idx]["id"])
+        elif target in all_ids:
+            resolved.append(target)
+    return resolved
 
 
 # ═══════════════════════════════════════
@@ -1433,6 +1709,7 @@ def main():
     # collect
     p_collect = sub.add_parser("collect", help="收集对话到本地归档")
     p_collect.add_argument("--remote", nargs="*", help="远程 SSH 主机名")
+    p_collect.add_argument("-v", "--verbose", action="store_true")
 
     # index
     sub.add_parser("index", help="重建索引")
@@ -1442,20 +1719,47 @@ def main():
     p_list.add_argument("query", nargs="?", help="搜索关键词")
     p_list.add_argument("--source", help="按工具筛选 (cursor/claude/claude-internal/codebuddy)")
     p_list.add_argument("--host", help="按主机筛选")
+    p_list.add_argument("--state", help="按提炼状态筛选 (pending/done/outdated/skipped)")
+    p_list.add_argument("--pending", action="store_true", help="仅显示待提炼 (pending + outdated)")
     p_list.add_argument("--limit", type=int, default=20, help="显示条数 (默认 20)")
+    p_list.add_argument("--offset", type=int, default=0, help="跳过前 N 条 (分页)")
+    p_list.add_argument("--since", help="只显示此日期之后的对话 (YYYY-MM-DD)")
+    p_list.add_argument("--days", type=int, help="只显示最近 N 天的对话")
 
     # show
     p_show = sub.add_parser("show", help="查看对话详情")
     p_show.add_argument("id", help="对话编号或 ID")
+    p_show.add_argument("--full", action="store_true", help="显示完整对话，不截断")
 
     # stats
     sub.add_parser("stats", help="显示统计信息")
+
+    # triage
+    sub.add_parser("triage", help="输出待提炼对话摘要 (JSON)，供 AI 批量判值")
+
+    # done
+    p_done = sub.add_parser("done", help="标记对话为已提炼（支持批量）")
+    p_done.add_argument("ids", nargs="+", help="对话编号或 ID（可传多个）")
+    p_done.add_argument("--channels", help="存储通道 (逗号分隔, 如 notion,local)")
+    p_done.add_argument("--note-title", help="笔记标题")
+
+    # skip
+    p_skip = sub.add_parser("skip", help="标记对话为跳过（支持批量）")
+    p_skip.add_argument("ids", nargs="+", help="对话编号或 ID（可传多个）")
+    p_skip.add_argument("--reason", help="跳过原因")
+
+    # reset
+    p_reset = sub.add_parser("reset", help="重置对话状态为 pending（支持批量）")
+    p_reset.add_argument("ids", nargs="+", help="对话编号或 ID（可传多个）")
 
     args = parser.parse_args()
 
     if not args.command:
         parser.print_help()
         return
+
+    global _verbose
+    _verbose = getattr(args, 'verbose', False)
 
     commands = {
         "scan": cmd_scan,
@@ -1464,6 +1768,10 @@ def main():
         "list": cmd_list,
         "show": cmd_show,
         "stats": cmd_stats,
+        "triage": cmd_triage,
+        "done": cmd_done,
+        "skip": cmd_skip,
+        "reset": cmd_reset,
     }
     commands[args.command](args)
 
