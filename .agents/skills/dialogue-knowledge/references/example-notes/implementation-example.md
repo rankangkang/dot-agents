@@ -1,42 +1,32 @@
 ---
-title: rsync include/exclude 顺序陷阱：目录必须先 include
+title: init.sh 中通过符号链接分发 rules 文件到各 AI 工具目录
 type: implementation
-tags: [rsync, ssh, python]
+category: Tools
+tags: [dot-agents, shell, 符号链接, 工程化]
 source_tool: cursor
-source_id: 345ghi-678jkl
-created: 2026-03-16
+source_id: example-impl-001
+created: 2026-03-14
 ---
 
-## 要做的事
+dot-agents 的 `init.sh` 需要把 `.agents/rules/` 下的规则文件通过符号链接分发到各 AI 工具的配置目录（`.cursor/rules/`、`.claude/` 等）。难点在于 rules 目录可能有嵌套子文件夹，链接需要保留目录结构。
 
-用 rsync 从远程开发机同步 `.jsonl` 文件到本地，只要 `.jsonl`，不要其他文件，但要保留目录结构。
+## 实现思路
 
-## 不查就写不出来的部分
-
-### rsync 的 include/exclude 顺序
+遍历 `.agents/rules/` 下所有 `.md` 文件（包括子目录中的），在目标目录中创建对应的目录结构，然后建符号链接。关键是用 `find` + 相对路径计算：
 
 ```bash
-rsync -avz \
-  --include='*/' \          # 1. 先放行所有目录
-  --include='*.jsonl' \     # 2. 再放行目标文件
-  --exclude='*' \           # 3. 最后排除其余一切
-  remote:~/.cursor/projects/ \
-  local/archive/
+find "$rules_dir" -name "*.md" -type f | while read -r rule_file; do
+  rel_path="${rule_file#$rules_dir/}"           # 相对路径，如 "frontend/react.md"
+  target_dir="$cursor_rules_dir/$(dirname "$rel_path")"
+  mkdir -p "$target_dir"
+  ln -sf "$rule_file" "$target_dir/$(basename "$rel_path")"
+done
 ```
 
-**`--include='*/'` 必须在 `--exclude='*'` 前面。** 否则目录本身会被排除，rsync 根本不会进入子目录去找 `.jsonl` 文件。这个顺序每次都会忘。
+## 注意事项
 
-### SSH subprocess 防挂起
+**符号链接用绝对路径**。如果用相对路径，当工具从不同的工作目录读取链接时会找不到源文件。`ln -sf` 的源路径应该是 `$rule_file` 的绝对路径（`find` 传入绝对路径的 `$rules_dir` 即可保证）。
 
-用 `subprocess` 调 SSH 时，如果远程主机要求密码，进程会静默挂起。两个必加参数：
+**幂等性**。`ln -sf` 的 `-f` 会覆盖已存在的链接，所以重复执行 `init.sh` 不会报错。但如果用户手动在目标目录放了同名的普通文件（不是链接），`-f` 也会覆盖掉，需要在文档中说明。
 
-```python
-["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd]
-```
-
-`BatchMode=yes` 禁止交互式密码提示（直接报错退出），`ConnectTimeout=5` 防止不可达主机阻塞整个流程。
-
-## 踩坑
-
-- **rsync 尾部斜杠**：`remote:path/` 同步目录内容，`remote:path` 同步目录本身（连目录名一起带过来）。每次都搞混，记住：**想要内容就加斜杠**
-- **rsync 返回码 23**：部分文件传输失败（通常是权限），不是致命错误，可以 `returncode in (0, 23)` 都视为成功
+**跨工具差异**。`.cursor/rules/` 目录支持嵌套结构，但 `.claude/` 只读根目录下的 `CLAUDE.md`，不支持子目录——对 Claude 只需要链接单个文件，不需要递归。

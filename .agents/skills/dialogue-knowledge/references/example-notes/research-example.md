@@ -1,32 +1,33 @@
 ---
-title: Python 任务队列：asyncio 技术栈选 arq，复杂工作流才上 Celery
+title: Electron 视频导出方案：ffmpeg-static vs @ffmpeg/ffmpeg WASM
 type: research
-tags: [python, task-queue, celery, dramatiq, arq]
-source_tool: claude
-source_id: 789abc-012def
+category: Frontend
+tags: [Electron, ffmpeg, WASM, 视频处理]
+source_tool: codebuddy-ide
+source_id: example-research-001
 created: 2026-03-12
 ---
 
-## 核心约束
+Electron 桌面端做模板化视频处理（单视频 + 边框/水印/模糊背景），导出环节需要用 ffmpeg。两条路线：原生二进制（ffmpeg-static）和 WASM（@ffmpeg/ffmpeg），核心取舍是**性能 vs 分发便利性**。
 
-项目是 FastAPI + asyncio 技术栈，Redis 已在用，任务逻辑简单（发邮件、生报表），日均 5 万，不需要复杂工作流（优先级队列、canvas 组合、定时调度等）。
+## 两条路线
 
-## 决策分叉点
+### ffmpeg-static（原生）
 
-```
-你的技术栈是 asyncio 吗？
-  ├─ 是 → 任务逻辑需要复杂工作流（canvas/优先级/多 broker）吗？
-  │    ├─ 是 → Celery（生态最全，但和 asyncio 不是原生集成）
-  │    └─ 否 → arq（纯 asyncio，2 个依赖，5 分钟上手）
-  └─ 否 → 追求简洁 API → Dramatiq；需要全家桶 → Celery
-```
+主进程通过 `child_process` 调用打包好的 ffmpeg 二进制。性能最好，支持硬件编码（NVENC/VideoToolbox），长视频和 4K 无压力。缺点是每个平台需要打包对应的二进制，应用体积增加 ~70MB。
 
-关键对比：arq 只支持 Redis 做 broker，没有优先级队列，社区最小。但如果你已经用 Redis 且任务简单，这些都不是问题。
+### @ffmpeg/ffmpeg（WASM）
 
-## 什么时候该换
+在渲染进程或 Worker 中运行 ffmpeg 的 WASM 编译版本。跨平台零配置，不需要额外打包二进制。但没有硬件编码，长视频处理明显慢，大文件受 MEMFS 内存限制（浏览器环境通常 2-4GB 上限）。
 
-如果后续出现以下任一需求，从 arq 迁移到 Dramatiq（API 风格相近，迁移成本低）：
-- 需要 RabbitMQ 做 broker（消息可靠性要求高）
-- 需要优先级队列
-- 需要限速/限流控制
-- Worker 数量超过 20 台
+## 怎么选
+
+模板化工具处理的通常是短视频（< 5 分钟），分辨率不超过 1080p → **WASM 够用**，分发简单。
+
+如果需要处理长视频、4K、或者对导出速度有要求 → 必须用 **原生 ffmpeg-static**。
+
+折中方案：默认用 WASM，检测到本机有 ffmpeg 时自动切换到原生路径。
+
+## 补充：预览不需要 ffmpeg
+
+预览阶段用 `<video>` 标签播放 + Konva/DOM 叠层做边框和水印，解码和音视频同步交给浏览器，不需要 ffmpeg 参与。只有最终导出时才需要 ffmpeg 合成滤镜。
