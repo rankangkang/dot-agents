@@ -1,58 +1,42 @@
 ---
-title: 用 SSH config + rsync 实现远程 AI 对话文件同步
+title: rsync include/exclude 顺序陷阱：目录必须先 include
 type: implementation
-tags: [ssh, rsync, python, subprocess]
+tags: [rsync, ssh, python]
 source_tool: cursor
 source_id: 345ghi-678jkl
 created: 2026-03-16
 ---
 
-## 需求概述
+## 要做的事
 
-从远程开发机同步 AI 编程工具（Cursor/Claude Code）的对话文件到本地，要求增量同步、自动发现远程主机。
+用 rsync 从远程开发机同步 `.jsonl` 文件到本地，只要 `.jsonl`，不要其他文件，但要保留目录结构。
 
-## 技术方案
+## 不查就写不出来的部分
 
-1. 读取 `~/.ssh/config` 获取已配置的远程主机列表
-2. 通过 SSH 执行 `find` 命令扫描远程主机上的对话文件
-3. 使用 `rsync -avz` 增量同步到本地归档目录
-
-## 关键实现细节
-
-### 解析 SSH config
-
-```python
-def load_ssh_hosts() -> list[str]:
-    ssh_config = Path.home() / ".ssh" / "config"
-    hosts = []
-    for line in ssh_config.read_text().splitlines():
-        line = line.strip()
-        if line.lower().startswith("host ") and "*" not in line:
-            for h in line.split()[1:]:
-                if h and not h.startswith("#"):
-                    hosts.append(h)
-    return sorted(set(hosts))
-```
-
-### rsync 的 include/exclude 技巧
-
-只同步 `.jsonl` 文件，但保留目录结构：
+### rsync 的 include/exclude 顺序
 
 ```bash
 rsync -avz \
-  --include='*/' \
-  --include='*.jsonl' \
-  --exclude='*' \
-  --exclude='subagents/' \
+  --include='*/' \          # 1. 先放行所有目录
+  --include='*.jsonl' \     # 2. 再放行目标文件
+  --exclude='*' \           # 3. 最后排除其余一切
   remote:~/.cursor/projects/ \
-  local/archive/cursor/
+  local/archive/
 ```
 
-`--include='*/'` 必须在前面，否则目录本身会被 `--exclude='*'` 排除。
+**`--include='*/'` 必须在 `--exclude='*'` 前面。** 否则目录本身会被排除，rsync 根本不会进入子目录去找 `.jsonl` 文件。这个顺序每次都会忘。
 
-## 踩坑与注意事项
+### SSH subprocess 防挂起
 
-- **SSH BatchMode** — 必须设置 `BatchMode=yes`，否则密码提示会导致 subprocess 挂起
-- **ConnectTimeout** — 设置合理的超时（5s），避免不可达的主机阻塞整个流程
-- **rsync 返回码** — 返回码 0 表示成功，23 表示部分传输错误（通常是权限问题），24 表示源文件消失（可忽略）
-- **路径末尾的斜杠** — `rsync` 对尾部 `/` 敏感，`remote:path/` 同步目录内容，`remote:path` 同步目录本身
+用 `subprocess` 调 SSH 时，如果远程主机要求密码，进程会静默挂起。两个必加参数：
+
+```python
+["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host, cmd]
+```
+
+`BatchMode=yes` 禁止交互式密码提示（直接报错退出），`ConnectTimeout=5` 防止不可达主机阻塞整个流程。
+
+## 踩坑
+
+- **rsync 尾部斜杠**：`remote:path/` 同步目录内容，`remote:path` 同步目录本身（连目录名一起带过来）。每次都搞混，记住：**想要内容就加斜杠**
+- **rsync 返回码 23**：部分文件传输失败（通常是权限），不是致命错误，可以 `returncode in (0, 23)` 都视为成功

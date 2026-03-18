@@ -1,34 +1,28 @@
 ---
-title: FastAPI 路由中嵌套代码块导致 JSON 解析截断
+title: orjson 遇到连续反引号会截断 JSON 输出
 type: debug
-tags: [python, fastapi, json, markdown]
+tags: [python, fastapi, orjson, json]
 source_tool: cursor
 source_id: abc123-def456
 created: 2026-03-15
 ---
 
-## 问题现象
+## 症状
 
-在 FastAPI 接口中返回包含 Markdown 代码块的 JSON 响应时，前端只收到一半内容。浏览器 DevTools 显示响应 body 在某个 ``` 标记处被截断。
+FastAPI 接口返回的 JSON 被截断——前端只收到一半。DevTools 里看到响应 body 在某个 ``` 标记处断掉，`Content-Length` 比实际 body 小。
 
-## 排查过程
+## 弯路
 
-1. **初步怀疑 Content-Length 不匹配** — 检查响应头，发现 `Content-Length` 确实小于实际 body 长度
-2. **排除中间件问题** — 移除所有中间件后问题依旧
-3. **定位到序列化环节** — 用 `json.dumps()` 手动序列化对比，发现 FastAPI 默认的 `jsonable_encoder` 对包含反引号的字符串处理异常
-4. **根因确认** — 当 Markdown 内容包含 ```` ``` ```` 时，`orjson`（项目替换了默认 JSON 引擎）的某个版本存在 bug，将三个反引号误判为字符串结束符
+第一反应是怀疑传输层（中间件、nginx），花了 20 分钟逐个排除。实际上 `Content-Length` 不匹配这个线索已经指向了**序列化环节**——响应还没发出去就已经错了，根本不用查传输。
 
 ## 根因
 
-`orjson==3.9.2` 在处理包含连续反引号的字符串时存在边界 bug，导致 JSON 输出提前截断。
+项目把 FastAPI 的 JSON 引擎换成了 `orjson`。`orjson==3.9.2` 在处理包含连续反引号（` ``` `）的字符串时有边界 bug，会提前截断输出。升级到 `3.9.7` 修复。
 
-## 解决方案
+## 下次怎么查
 
-```bash
-pip install orjson==3.9.7  # 升级到修复版本
-```
+看到 `Content-Length` 与 body 长度不一致 → **先查序列化**，不查传输。用 `json.dumps()` 手动序列化对比，10 秒就能定位到是不是 JSON 引擎的锅。
 
 ## 教训
 
-- 替换 JSON 引擎后要用包含特殊字符（反引号、Unicode、嵌套引号）的测试数据做回归
-- 当 `Content-Length` 与实际 body 不一致时，优先检查序列化环节而非传输环节
+替换 JSON 引擎（orjson、ujson 等）后，测试用例里要包含特殊字符：连续反引号、Unicode emoji、嵌套引号、超长字符串。这些是序列化引擎最容易出 bug 的地方。

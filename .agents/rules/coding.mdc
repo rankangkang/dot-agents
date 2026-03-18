@@ -1,6 +1,9 @@
 ---
-globs: "**/*.{ts,tsx,js,jsx}"
+description: js/ts 代码编写规则，编写 js/ts 代码时需遵守
 alwaysApply: false
+enabled: true
+updatedAt: 2026-03-18T03:43:34.470Z
+provider: 
 ---
 
 # 编码规范
