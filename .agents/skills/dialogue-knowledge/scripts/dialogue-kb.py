@@ -5,8 +5,8 @@
 收集对话记录，解析为统一格式，构建本地知识库索引。
 
 用法:
-  dialogue-kb scan   [--remote HOST...]    扫描本地+远程的 AI 对话文件
-  dialogue-kb collect [--remote HOST...]   同步远程对话到本地归档
+  dialogue-kb scan   [--local-only] [--remote HOST...]   扫描本机；默认再扫 ~/.ssh/config 中全部 Host
+  dialogue-kb collect [--local-only] [--remote HOST...]  收集到归档；远程规则同 scan
   dialogue-kb index                        解析对话并构建索引
   dialogue-kb list   [--source X] [QUERY]  列出/搜索对话
   dialogue-kb show   <ID> [--full]         查看对话详情
@@ -17,70 +17,38 @@
   dialogue-kb stats                        显示统计信息
 
 纯 Python 标准库实现，零依赖。
+新增工具：在 adapters/ 目录下添加一个 Adapter 类，无需修改本文件。
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import os
 import re
-import shlex
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
 
-# ── 常量 ──
+# ── 加载 adapters 包 ─────────────────────────────────────────────────────────
+# 将本文件所在目录加入 sys.path，使 `from adapters import ...` 可用
+sys.path.insert(0, str(Path(__file__).parent))
+from adapters import ADAPTER_BY_NAME, ADAPTERS  # noqa: E402
+
+# ── 常量 ─────────────────────────────────────────────────────────────────────
 
 DEFAULT_ARCHIVE_DIR = Path.home() / ".ai-dialogues"
 CONFIG_FILE = "config.yaml"
 INDEX_FILE = "index.json"
 
-TOOL_DIRS = {
-    "cursor": Path.home() / ".cursor",
-    "claude": Path.home() / ".claude",
-    "claude-internal": Path.home() / ".claude-internal",
-    "codebuddy": Path.home() / ".codebuddy",
-}
+# ── 颜色输出 ─────────────────────────────────────────────────────────────────
 
-# 用于对话内容预处理时剔除的噪声模式
-NOISE_PATTERNS = [
-    (re.compile(r"<thinking>[\s\S]*?</thinking>", re.I), ""),
-    (re.compile(r"<antml_thinking>[\s\S]*?</antml_thinking>", re.I), ""),
-    (re.compile(r"<antml_function_calls>[\s\S]*?</antml_function_calls>", re.I), ""),
-    (re.compile(r"<function_calls>[\s\S]*?</function_calls>", re.I), ""),
-    (re.compile(r"<tool_use>[\s\S]*?</tool_use>", re.I), ""),
-    (re.compile(r"<tool_call>[\s\S]*?</tool_call>", re.I), ""),
-    (re.compile(r"<tool_result>[\s\S]*?</tool_result>", re.I), ""),
-    (re.compile(r"<rules>[\s\S]*?</rules>", re.I), ""),
-    (re.compile(r"<memories>[\s\S]*?</memories>", re.I), ""),
-    (re.compile(r"<user_info>[\s\S]*?</user_info>", re.I), ""),
-    (re.compile(r"<attached_files>[\s\S]*?</attached_files>", re.I), ""),
-    (re.compile(r"<open_and_recently_viewed_files>[\s\S]*?</open_and_recently_viewed_files>", re.I), ""),
-    (re.compile(r"<agent_skills>[\s\S]*?</agent_skills>", re.I), ""),
-    (re.compile(r"<local-command-caveat>[\s\S]*?</local-command-caveat>", re.I), ""),
-    (re.compile(r"<local-command-stdout>[\s\S]*?</local-command-stdout>", re.I), ""),
-    (re.compile(r"<command-name>[\s\S]*?</command-name>", re.I), ""),
-    (re.compile(r"<command-message>[\s\S]*?</command-message>", re.I), ""),
-    (re.compile(r"<command-args>[\s\S]*?</command-args>", re.I), ""),
-    (re.compile(r"<system_reminder>[\s\S]*?</system_reminder>", re.I), ""),
-    (re.compile(r"<git_status>[\s\S]*?</git_status>", re.I), ""),
-]
-
-_SKIP_FOR_TITLE_RE = re.compile(
-    r"^(<local-command|<command-|Caveat: The messages below|<system_reminder>)",
-    re.I,
-)
-
-# ── 颜色输出 ──
 
 def _c(code, text):
     if sys.stdout.isatty():
         return f"\033[{code}m{text}\033[0m"
     return text
+
 
 def green(t):  return _c("32", t)
 def yellow(t): return _c("33", t)
@@ -90,7 +58,9 @@ def dim(t):    return _c("2", t)
 def red(t):    return _c("31", t)
 def bold(t):   return _c("1", t)
 
+
 _verbose = False
+
 
 def _warn(msg: str):
     if _verbose:
@@ -112,10 +82,7 @@ def load_config(archive_dir: Path) -> dict:
 def save_config(archive_dir: Path, config: dict):
     config_path = archive_dir / CONFIG_FILE
     archive_dir.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"archive_dir: {config.get('archive_dir', str(archive_dir))}",
-        "",
-    ]
+    lines = [f"archive_dir: {config.get('archive_dir', str(archive_dir))}", ""]
     if config.get("remotes"):
         lines.append("remotes:")
         for remote in config["remotes"]:
@@ -126,7 +93,6 @@ def save_config(archive_dir: Path, config: dict):
 def _parse_simple_yaml(text: str) -> dict:
     """极简 YAML 解析器，只处理本项目用到的扁平结构。"""
     result = {"remotes": []}
-    current_remote = None
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -135,8 +101,7 @@ def _parse_simple_yaml(text: str) -> dict:
             continue
         if stripped.startswith("- host:"):
             host = stripped.split(":", 1)[1].strip()
-            current_remote = {"host": host}
-            result["remotes"].append(current_remote)
+            result["remotes"].append({"host": host})
         elif not line.startswith(" ") and ":" in stripped:
             key, val = stripped.split(":", 1)
             result[key.strip()] = val.strip()
@@ -161,134 +126,76 @@ def load_ssh_hosts() -> list[str]:
     return sorted(set(hosts))
 
 
+def resolve_remote_hosts(args) -> tuple[list[str], str]:
+    """解析 scan/collect 使用的远程主机列表及人类可读的范围说明。
+
+    规则:
+      - --local-only → 不连远程
+      - 显式传入 --remote A B → 仅这些主机（``--remote`` 无参数等价于空列表，不连远程）
+      - 默认 → ~/.ssh/config 中全部 Host（不含通配符）
+    """
+    if getattr(args, "local_only", False):
+        return [], "无（已 --local-only）"
+    explicit = getattr(args, "remote", None)
+    if explicit is not None:
+        if explicit:
+            return list(explicit), f"指定 {len(explicit)} 台: {', '.join(explicit)}"
+        return [], "无（已 --remote 且未列主机名）"
+    hosts = load_ssh_hosts()
+    if not hosts:
+        return [], "无（~/.ssh/config 中无可用 Host 条目）"
+    return hosts, f"SSH 配置全部 Host（{len(hosts)} 台）: {', '.join(hosts)}"
+
+
+def _short_label(text: str, max_len: int = 42) -> str:
+    """列表中项目名等过长时截断。"""
+    t = (text or "").strip() or "—"
+    if len(t) <= max_len:
+        return t
+    return t[: max_len - 1] + "…"
+
+
 # ═══════════════════════════════════════
 # 扫描：发现对话文件
 # ═══════════════════════════════════════
 
 def scan_local() -> dict:
-    """扫描本地所有 AI 工具的对话文件。"""
-    result = {
-        "host": "localhost",
-        "sources": [],
-        "total_files": 0,
-    }
+    """扫描本地所有 AI 工具的对话文件（通过各 Adapter 发现）。"""
+    result: dict = {"host": "localhost", "sources": [], "total_files": 0}
 
-    # Cursor agent-transcripts
-    cursor_dir = TOOL_DIRS["cursor"] / "projects"
-    if cursor_dir.is_dir():
-        count = 0
-        projects = []
-        for project_dir in cursor_dir.iterdir():
-            if not project_dir.is_dir():
-                continue
-            transcripts_dir = project_dir / "agent-transcripts"
-            if not transcripts_dir.is_dir():
-                continue
-            jsonl_files = list(transcripts_dir.rglob("*.jsonl"))
-            parent_files = [f for f in jsonl_files if "subagents" not in str(f)]
-            if parent_files:
-                project_name = project_dir.name.replace("Users-", "").replace("-", "/")
-                projects.append({
-                    "name": project_name,
-                    "path": str(transcripts_dir),
-                    "count": len(parent_files),
-                })
-                count += len(parent_files)
-        if count > 0:
-            result["sources"].append({
-                "tool": "cursor",
-                "type": "agent-transcripts",
-                "projects": projects,
-                "count": count,
-            })
-            result["total_files"] += count
-
-    # Claude Code / claude-internal / codebuddy — 统一扫描 projects/ 目录
-    for tool_name in ["claude", "claude-internal", "codebuddy"]:
-        tool_dir = TOOL_DIRS.get(tool_name)
-        if not tool_dir:
+    for adapter in ADAPTERS:
+        sessions = adapter.local_sessions()
+        if not sessions:
             continue
-        projects_dir = tool_dir / "projects"
-        if not projects_dir.is_dir():
-            continue
-        jsonl_files = list(projects_dir.rglob("*.jsonl"))
-        parent_files = [f for f in jsonl_files if "subagents" not in str(f)]
-        if parent_files:
-            # 按项目分组
-            projects = {}
-            for f in parent_files:
-                rel = f.relative_to(projects_dir)
-                project_name = str(rel.parts[0]) if len(rel.parts) > 1 else "default"
-                projects.setdefault(project_name, []).append(f)
-            project_list = [
-                {"name": name, "path": str(projects_dir / name), "count": len(files)}
-                for name, files in sorted(projects.items())
-            ]
-            result["sources"].append({
-                "tool": tool_name,
-                "type": "jsonl-sessions",
-                "projects": project_list,
-                "count": len(parent_files),
-            })
-            result["total_files"] += len(parent_files)
-
-    # CodeBuddy IDE — directory-based format
-    cb_ide_candidates = [
-        Path.home() / "Library" / "Application Support" / "CodeBuddyExtension" / "Data",
-        Path.home() / ".local" / "share" / "CodeBuddyExtension",
-    ]
-    for cb_base in cb_ide_candidates:
-        if not cb_base.is_dir():
-            continue
-        try:
-            proc = subprocess.run(
-                f"find {shlex.quote(str(cb_base))} -maxdepth 10 -type d -name history 2>/dev/null | head -10",
-                shell=True, capture_output=True, text=True, timeout=10,
-            )
-            for hist_dir in proc.stdout.strip().splitlines():
-                hist_dir = hist_dir.strip()
-                if not hist_dir:
-                    continue
-                hist_path = Path(hist_dir)
-                session_count = sum(1 for p in hist_path.iterdir() if p.is_dir())
-                if session_count > 0:
-                    result["sources"].append({
-                        "tool": "codebuddy-ide",
-                        "type": "directory-sessions",
-                        "count": session_count,
-                        "path": hist_dir,
-                    })
-                    result["total_files"] += session_count
-        except Exception as e:
-            _warn(f"scan codebuddy-ide {cb_base}: {e}")
+        projects: dict[str, int] = {}
+        for _, project in sessions:
+            projects[project] = projects.get(project, 0) + 1
+        result["sources"].append({
+            "tool": adapter.tool_name,
+            "count": len(sessions),
+            "projects": [{"name": k, "count": v} for k, v in sorted(projects.items())],
+        })
+        result["total_files"] += len(sessions)
 
     return result
 
 
 def scan_remote(host: str, timeout: int = 30) -> dict:
     """通过 SSH 扫描远程主机上的 AI 对话文件。"""
-    result = {
-        "host": host,
-        "sources": [],
-        "total_files": 0,
-        "error": "",
-    }
+    result: dict = {"host": host, "sources": [], "total_files": 0, "error": ""}
 
-    combined_cmd = (
-        "echo '__CURSOR__';"
-        "find ~/.cursor/projects -maxdepth 4 -name '*.jsonl' -path '*/agent-transcripts/*' "
-        "! -path '*/subagents/*' 2>/dev/null | head -200;"
-        "echo '__CLAUDE__';"
-        "find ~/.claude/projects -maxdepth 4 -name '*.jsonl' "
-        "! -path '*/subagents/*' 2>/dev/null | head -200;"
-        "echo '__CLAUDE_INTERNAL__';"
-        "find ~/.claude-internal/projects -maxdepth 4 -name '*.jsonl' "
-        "! -path '*/subagents/*' 2>/dev/null | head -200;"
-        "echo '__CODEBUDDY__';"
-        "find ~/.codebuddy/projects -maxdepth 4 -name '*.jsonl' "
-        "! -path '*/subagents/*' 2>/dev/null | head -200;"
-        "echo '__END__'"
-    )
+    # 从支持远程扫描的 Adapter 组装合并 SSH 命令
+    cmd_parts: list[str] = []
+    marker_to_tool: dict[str, str] = {}
+    for adapter in ADAPTERS:
+        marker = adapter.remote_section_marker()
+        if not marker:
+            continue
+        cmd_parts.append(f"echo '{marker}';")
+        cmd_parts.append(adapter.remote_find_cmd() + ";")
+        marker_to_tool[marker] = adapter.tool_name
+    cmd_parts.append("echo '__END__'")
+    combined_cmd = " ".join(cmd_parts)
 
     try:
         proc = subprocess.run(
@@ -300,18 +207,12 @@ def scan_remote(host: str, timeout: int = 30) -> dict:
             return result
 
         section = None
-        tool_map = {
-            "__CURSOR__": "cursor",
-            "__CLAUDE__": "claude",
-            "__CLAUDE_INTERNAL__": "claude-internal",
-            "__CODEBUDDY__": "codebuddy",
-        }
-        files_by_tool: dict[str, list[str]] = {t: [] for t in tool_map.values()}
+        files_by_tool: dict[str, list[str]] = {t: [] for t in marker_to_tool.values()}
 
         for line in proc.stdout.splitlines():
             line = line.strip()
-            if line in tool_map:
-                section = tool_map[line]
+            if line in marker_to_tool:
+                section = marker_to_tool[line]
             elif line == "__END__":
                 break
             elif section and line:
@@ -340,119 +241,28 @@ def scan_remote(host: str, timeout: int = 30) -> dict:
 
 def collect_local(archive_dir: Path) -> list[dict]:
     """收集本地 AI 工具的对话文件到归档目录。"""
-    results = []
-
-    for tool_name, tool_dir in TOOL_DIRS.items():
-        projects_dir = tool_dir / "projects"
-        if not projects_dir.is_dir():
-            continue
-
-        if tool_name == "cursor":
-            # Cursor: projects/*/agent-transcripts/*/*.jsonl
-            for project_dir in projects_dir.iterdir():
-                if not project_dir.is_dir():
-                    continue
-                transcripts_dir = project_dir / "agent-transcripts"
-                if not transcripts_dir.is_dir():
-                    continue
-                for session_dir in transcripts_dir.iterdir():
-                    if not session_dir.is_dir():
-                        continue
-                    for jsonl_file in session_dir.glob("*.jsonl"):
-                        if "subagents" in str(jsonl_file):
-                            continue
-                        dest = archive_dir / "archive" / "cursor" / project_dir.name / jsonl_file.name
-                        _copy_if_newer(jsonl_file, dest)
-                        results.append({
-                            "tool": "cursor",
-                            "project": project_dir.name,
-                            "file": jsonl_file.name,
-                            "source": str(jsonl_file),
-                        })
-        else:
-            # Claude/claude-internal/codebuddy: projects/**/*.jsonl
-            for jsonl_file in projects_dir.rglob("*.jsonl"):
-                if "subagents" in str(jsonl_file):
-                    continue
-                rel = jsonl_file.relative_to(projects_dir)
-                project_name = str(rel.parts[0]) if len(rel.parts) > 1 else "default"
-                dest = archive_dir / "archive" / tool_name / project_name / jsonl_file.name
-                _copy_if_newer(jsonl_file, dest)
-                results.append({
-                    "tool": tool_name,
-                    "project": project_name,
-                    "file": jsonl_file.name,
-                    "source": str(jsonl_file),
-                })
-
-    # CodeBuddy IDE — directory-based sessions
-    cb_ide_candidates = [
-        Path.home() / "Library" / "Application Support" / "CodeBuddyExtension" / "Data",
-        Path.home() / ".local" / "share" / "CodeBuddyExtension",
-    ]
-    for cb_base in cb_ide_candidates:
-        if not cb_base.is_dir():
-            continue
-        try:
-            proc = subprocess.run(
-                f"find {shlex.quote(str(cb_base))} -maxdepth 10 -type d -name history 2>/dev/null | head -10",
-                shell=True, capture_output=True, text=True, timeout=10,
-            )
-            for hist_dir in proc.stdout.strip().splitlines():
-                hist_dir = hist_dir.strip()
-                if not hist_dir:
-                    continue
-                hist_path = Path(hist_dir)
-                for workspace_dir in hist_path.iterdir():
-                    if not workspace_dir.is_dir():
-                        continue
-                    for conv_dir in workspace_dir.iterdir():
-                        if not conv_dir.is_dir():
-                            continue
-                        idx_file = conv_dir / "index.json"
-                        if not idx_file.exists():
-                            continue
-                        # 复制整个会话目录到归档
-                        dest_base = archive_dir / "archive" / "codebuddy-ide" / workspace_dir.name / conv_dir.name
-                        _copy_dir_if_newer(conv_dir, dest_base)
-                        results.append({
-                            "tool": "codebuddy-ide",
-                            "project": workspace_dir.name,
-                            "file": conv_dir.name,
-                            "source": str(conv_dir),
-                        })
-        except Exception as e:
-            _warn(f"collect codebuddy-ide {cb_base}: {e}")
-
+    results: list[dict] = []
+    for adapter in ADAPTERS:
+        for src, project in adapter.local_sessions():
+            adapter.copy_to_archive(src, project, archive_dir)
+            results.append({
+                "tool": adapter.tool_name,
+                "project": project,
+                "file": src.name,  # 文件名或会话目录名（CodeBuddy IDE 为目录）
+                "source": str(src),
+            })
     return results
-
-
-def _copy_dir_if_newer(src_dir: Path, dest_dir: Path):
-    """递归复制目录，仅当源文件比目标新时才复制。"""
-    import shutil as _shutil
-    for src_file in src_dir.rglob("*"):
-        if not src_file.is_file():
-            continue
-        rel = src_file.relative_to(src_dir)
-        dest_file = dest_dir / rel
-        if dest_file.exists() and dest_file.stat().st_mtime >= src_file.stat().st_mtime:
-            continue
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        _shutil.copy2(src_file, dest_file)
 
 
 def collect_remote(host: str, archive_dir: Path, timeout: int = 180) -> list[dict]:
     """通过 rsync 从远程主机同步对话文件到本地归档。"""
-    results = []
+    results: list[dict] = []
 
-    for tool_name in ["cursor", "claude", "claude-internal", "codebuddy"]:
-        if tool_name == "cursor":
-            remote_path = f"{host}:~/.cursor/projects/"
-            local_dir = archive_dir / "archive" / f"{host}" / "cursor"
-        else:
-            remote_path = f"{host}:~/.{tool_name}/projects/"
-            local_dir = archive_dir / "archive" / f"{host}" / tool_name
-
+    for adapter in ADAPTERS:
+        rsync_info = adapter.remote_rsync(host, archive_dir)
+        if not rsync_info:
+            continue
+        remote_src, local_dir = rsync_info
         local_dir.mkdir(parents=True, exist_ok=True)
 
         cmd = [
@@ -461,29 +271,28 @@ def collect_remote(host: str, archive_dir: Path, timeout: int = 180) -> list[dic
             "--include=*.jsonl",
             "--exclude=*",
             "--exclude=subagents/",
-            remote_path,
+            remote_src,
             str(local_dir) + "/",
         ]
-
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
             synced = [l for l in proc.stdout.splitlines() if l.endswith(".jsonl")]
             results.append({
                 "host": host,
-                "tool": tool_name,
+                "tool": adapter.tool_name,
                 "status": "success" if proc.returncode == 0 else "error",
                 "files_synced": len(synced),
                 "message": proc.stderr.strip()[:200] if proc.returncode != 0 else "",
             })
         except subprocess.TimeoutExpired:
             results.append({
-                "host": host, "tool": tool_name,
+                "host": host, "tool": adapter.tool_name,
                 "status": "error", "files_synced": 0,
                 "message": f"Timeout after {timeout}s",
             })
         except Exception as e:
             results.append({
-                "host": host, "tool": tool_name,
+                "host": host, "tool": adapter.tool_name,
                 "status": "error", "files_synced": 0,
                 "message": str(e),
             })
@@ -491,422 +300,9 @@ def collect_remote(host: str, archive_dir: Path, timeout: int = 180) -> list[dic
     return results
 
 
-def _copy_if_newer(src: Path, dest: Path):
-    """仅当源文件比目标新时才复制。"""
-    if dest.exists() and dest.stat().st_mtime >= src.stat().st_mtime:
-        return
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    import shutil
-    shutil.copy2(src, dest)
-
-
-# ═══════════════════════════════════════
-# 解析：各工具格式 → 统一结构
-# ═══════════════════════════════════════
-
-def strip_noise(text: str) -> str:
-    """剔除对话内容中的噪声块（thinking/tool_call/system info 等）。"""
-    for pattern, replacement in NOISE_PATTERNS:
-        text = pattern.sub(replacement, text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
-
-
-def parse_cursor_jsonl(filepath: Path) -> dict | None:
-    """解析 Cursor agent-transcripts JSONL 文件。
-
-    格式: 每行一个 JSON, {role: "user"|"assistant", message: {content: [{type, text}]}}
-    """
-    try:
-        lines = filepath.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-    except Exception:
-        return None
-
-    if not lines:
-        return None
-
-    turns = []
-    first_user_text = ""
-    first_ts = None
-
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        role = obj.get("role", "")
-        if role not in ("user", "assistant"):
-            continue
-
-        content_blocks = obj.get("message", {}).get("content", [])
-        text_parts = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-            elif isinstance(block, str):
-                text_parts.append(block)
-
-        full_text = "\n".join(text_parts).strip()
-        if not full_text:
-            continue
-
-        # 提取 user_query 标签中的实际问题
-        clean_text = full_text
-        uq_match = re.search(r"<user_query>([\s\S]*?)</user_query>", full_text)
-        if uq_match:
-            clean_text = uq_match.group(1).strip()
-
-        clean_text = strip_noise(clean_text)
-        if not clean_text:
-            continue
-
-        if role == "user" and not first_user_text:
-            first_user_text = clean_text[:200]
-
-        turns.append({"role": role, "text": clean_text})
-
-    if len(turns) < 2:
-        return None
-
-    session_id = filepath.stem
-    try:
-        file_ts = datetime.fromtimestamp(filepath.stat().st_mtime, tz=timezone.utc).isoformat()
-    except Exception:
-        file_ts = None
-    return {
-        "id": session_id,
-        "source": "cursor",
-        "file": str(filepath),
-        "title": _extract_title(first_user_text),
-        "first_question": first_user_text,
-        "turn_count": len(turns),
-        "user_turns": sum(1 for t in turns if t["role"] == "user"),
-        "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
-        "timestamp": file_ts,
-        "turns": turns,
-    }
-
-
-def parse_claude_jsonl(filepath: Path) -> dict | None:
-    """解析 Claude Code / claude-internal JSONL 文件。
-
-    格式: 每行一个 JSON, {type: "user"|"assistant"|..., message: {content: ...}, timestamp: ...}
-    """
-    try:
-        lines = filepath.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-    except Exception:
-        return None
-
-    if not lines:
-        return None
-
-    turns = []
-    first_user_text = ""
-    first_ts = None
-    session_id = filepath.stem
-    cwd = ""
-
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if not isinstance(obj, dict):
-            continue
-
-        msg_type = obj.get("type", "")
-        if msg_type not in ("user", "assistant"):
-            continue
-
-        # 跳过 sidechain 消息
-        if obj.get("isSidechain"):
-            continue
-
-        if not first_ts and obj.get("timestamp"):
-            first_ts = obj["timestamp"]
-        if not cwd and obj.get("cwd"):
-            cwd = obj["cwd"]
-
-        message = obj.get("message", {})
-        content = message.get("content", "")
-
-        text_parts = []
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-
-        full_text = "\n".join(text_parts).strip()
-        clean_text = strip_noise(full_text)
-        if not clean_text:
-            continue
-
-        if msg_type == "user" and not first_user_text:
-            if not _SKIP_FOR_TITLE_RE.match(clean_text):
-                uq_match = re.search(r"<user_query>([\s\S]*?)</user_query>", clean_text)
-                if uq_match:
-                    first_user_text = uq_match.group(1).strip()[:200]
-                else:
-                    first_user_text = clean_text[:200]
-
-        turns.append({"role": msg_type, "text": clean_text})
-
-    if len(turns) < 2:
-        return None
-
-    return {
-        "id": session_id,
-        "source": "claude",
-        "file": str(filepath),
-        "title": _extract_title(first_user_text),
-        "first_question": first_user_text,
-        "turn_count": len(turns),
-        "user_turns": sum(1 for t in turns if t["role"] == "user"),
-        "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
-        "timestamp": first_ts,
-        "cwd": cwd,
-        "turns": turns,
-    }
-
-
-def parse_codebuddy_jsonl(filepath: Path) -> dict | None:
-    """解析 CodeBuddy JSONL 文件。
-
-    格式: 每行一个 JSON, {type: "message", role: "user"|"assistant",
-          content: [{type: "input_text"|"output_text"|"text", text: "..."}]}
-    """
-    try:
-        lines = filepath.read_text(encoding="utf-8", errors="replace").strip().splitlines()
-    except Exception:
-        return None
-
-    if not lines:
-        return None
-
-    turns = []
-    first_user_text = ""
-    first_ts = None
-    cwd = ""
-
-    for line in lines:
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if not isinstance(obj, dict):
-            continue
-
-        role = obj.get("role", "")
-        if role not in ("user", "assistant"):
-            continue
-
-        if not first_ts and obj.get("timestamp"):
-            first_ts = obj["timestamp"]
-        if not cwd and obj.get("cwd"):
-            cwd = obj["cwd"]
-
-        content = obj.get("content", [])
-        text_parts = []
-        if isinstance(content, str):
-            text_parts.append(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    block_type = block.get("type", "")
-                    if block_type in ("text", "input_text", "output_text"):
-                        text_parts.append(block.get("text", ""))
-                elif isinstance(block, str):
-                    text_parts.append(block)
-
-        full_text = "\n".join(text_parts).strip()
-
-        # 跳过系统/命令消息
-        if full_text.startswith("Caveat: The messages below"):
-            continue
-        if "<command-name>" in full_text and len(full_text) < 200:
-            continue
-        if "<local-command-stdout>" in full_text and len(full_text) < 200:
-            continue
-
-        clean_text = strip_noise(full_text)
-        if not clean_text:
-            continue
-
-        if role == "user" and not first_user_text:
-            if not _SKIP_FOR_TITLE_RE.match(clean_text):
-                uq_match = re.search(r"<user_query>([\s\S]*?)</user_query>", clean_text)
-                if uq_match:
-                    first_user_text = uq_match.group(1).strip()[:200]
-                else:
-                    first_user_text = clean_text[:200]
-
-        turns.append({"role": role, "text": clean_text})
-
-    if len(turns) < 2:
-        return None
-
-    return {
-        "id": filepath.stem,
-        "source": "codebuddy",
-        "file": str(filepath),
-        "title": _extract_title(first_user_text),
-        "first_question": first_user_text,
-        "turn_count": len(turns),
-        "user_turns": sum(1 for t in turns if t["role"] == "user"),
-        "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
-        "timestamp": first_ts,
-        "cwd": cwd,
-        "turns": turns,
-    }
-
-
-def parse_codebuddy_ide_session(conv_dir: Path) -> dict | None:
-    """解析 CodeBuddy IDE 的目录结构会话。
-
-    目录布局:
-      conv_dir/
-        index.json          — 消息列表（有序）+ requests
-        messages/
-          {msg_id}.json     — 单条消息文件
-    """
-    index_path = conv_dir / "index.json"
-    if not index_path.exists():
-        return None
-
-    try:
-        index = json.loads(index_path.read_text(encoding="utf-8", errors="replace"))
-    except Exception:
-        return None
-
-    msg_list = index.get("messages", [])
-    if not msg_list:
-        return None
-
-    requests = index.get("requests", [])
-    first_ts = None
-    if requests:
-        try:
-            started = requests[0].get("startedAt")
-            if isinstance(started, (int, float)):
-                first_ts = datetime.fromtimestamp(started / 1000, tz=timezone.utc).isoformat()
-        except Exception:
-            pass
-
-    msg_files = {}
-    msgs_dir = conv_dir / "messages"
-    if msgs_dir.is_dir():
-        for f in msgs_dir.iterdir():
-            if f.suffix == ".json":
-                msg_files[f.stem] = f
-
-    turns = []
-    first_user_text = ""
-
-    for msg_meta in msg_list:
-        msg_id = msg_meta.get("id", "")
-        role = msg_meta.get("role", "")
-        if role not in ("user", "assistant"):
-            continue
-
-        msg_file = msg_files.get(msg_id)
-        if not msg_file:
-            continue
-        try:
-            raw = json.loads(msg_file.read_text(encoding="utf-8", errors="replace"))
-        except Exception:
-            continue
-
-        msg_body = raw.get("message", "")
-        if isinstance(msg_body, str):
-            try:
-                msg_body = json.loads(msg_body)
-            except Exception:
-                continue
-
-        content_blocks = msg_body.get("content", [])
-        if not isinstance(content_blocks, list):
-            continue
-
-        text_parts = []
-        for block in content_blocks:
-            if isinstance(block, dict) and block.get("type") == "text":
-                text_parts.append(block.get("text", ""))
-
-        full_text = "\n".join(text_parts).strip()
-        clean_text = strip_noise(full_text)
-        if not clean_text:
-            continue
-
-        if role == "user" and not first_user_text:
-            if not _SKIP_FOR_TITLE_RE.match(clean_text):
-                uq_match = re.search(r"<user_query>([\s\S]*?)</user_query>", clean_text)
-                if uq_match:
-                    first_user_text = uq_match.group(1).strip()[:200]
-                else:
-                    first_user_text = clean_text[:200]
-
-        turns.append({"role": role, "text": clean_text})
-
-    if len(turns) < 2:
-        return None
-
-    return {
-        "id": conv_dir.name,
-        "source": "codebuddy-ide",
-        "file": str(conv_dir),
-        "title": _extract_title(first_user_text),
-        "first_question": first_user_text,
-        "turn_count": len(turns),
-        "user_turns": sum(1 for t in turns if t["role"] == "user"),
-        "assistant_turns": sum(1 for t in turns if t["role"] == "assistant"),
-        "timestamp": first_ts,
-        "turns": turns,
-    }
-
-
-def _extract_title(text: str) -> str:
-    """从用户第一条消息中提取简短标题。"""
-    if not text:
-        return "Untitled"
-    clean = text.strip().split("\n")[0]
-    clean = re.sub(r"[#*`@]", "", clean).strip()
-    if len(clean) > 80:
-        clean = clean[:77] + "..."
-    return clean or "Untitled"
-
-
 # ═══════════════════════════════════════
 # 索引构建
 # ═══════════════════════════════════════
-
-def _file_fingerprint(filepath: Path) -> str:
-    """生成文件指纹（mtime + size），用于检测变更。"""
-    try:
-        st = filepath.stat()
-        return f"{st.st_mtime:.6f}:{st.st_size}"
-    except Exception:
-        return ""
-
-
-def _dir_fingerprint(dirpath: Path) -> str:
-    """生成目录指纹（所有文件的 mtime + size 组合哈希），用于检测变更。"""
-    parts = []
-    try:
-        for f in sorted(dirpath.rglob("*")):
-            if f.is_file():
-                st = f.stat()
-                parts.append(f"{f.name}:{st.st_mtime:.6f}:{st.st_size}")
-    except Exception:
-        pass
-    return hashlib.md5("|".join(parts).encode()).hexdigest()[:12] if parts else ""
-
 
 def _apply_distill_state(entry: dict, old: dict | None, new_turn_count: int):
     """根据旧条目的状态和新的 turn_count，决定提炼状态。
@@ -915,8 +311,8 @@ def _apply_distill_state(entry: dict, old: dict | None, new_turn_count: int):
       新条目                          → pending
       旧条目未变                      → 保持原状态
       旧条目 pending + 对话增长       → pending（还没提炼过，增长不影响）
-      旧条目 done   + 对话增长       → outdated（提炼过了但有新内容）
-      旧条目 done   + 对话未增长     → done
+      旧条目 done   + 对话增长        → outdated（提炼过了但有新内容）
+      旧条目 done   + 对话未增长      → done
       旧条目 skipped                  → skipped
     """
     if not old:
@@ -932,20 +328,11 @@ def _apply_distill_state(entry: dict, old: dict | None, new_turn_count: int):
     else:
         entry["distill_state"] = old_state
 
-    # 传递已有的提炼元数据
-    if old.get("distilled_at"):
-        entry["distilled_at"] = old["distilled_at"]
-    if old.get("note_file"):
-        entry["note_file"] = old["note_file"]
-    if old.get("channels"):
-        entry["channels"] = old["channels"]
-    if old.get("note_title"):
-        entry["note_title"] = old["note_title"]
-    if old.get("skip_reason"):
-        entry["skip_reason"] = old["skip_reason"]
+    for field in ("distilled_at", "note_file", "channels", "note_title", "skip_reason"):
+        if old.get(field):
+            entry[field] = old[field]
 
 
-# 用于快速判断对话是否为系统/命令消息的模式
 _COMMAND_TITLE_RE = re.compile(
     r"^(/model|/plugin|/help|/config|/quit|/exit|resume$|<local-command|<command-)",
     re.I,
@@ -958,8 +345,6 @@ def _compute_worth(entry: dict) -> str:
     返回:
       "auto_skip"  — 确定无价值（太短 / 无回复 / 纯命令）
       "normal"     — 需要 AI 判断（脚本无法确定价值）
-
-    内容相关的价值判断（标题关键词、对话质量等）交给 AI 在 triage 阶段做。
     """
     turns = entry.get("turn_count", 0)
     user_turns = entry.get("user_turns", 0)
@@ -981,20 +366,50 @@ def _compute_worth(entry: dict) -> str:
     return "normal"
 
 
+def _timestamp_sort_value(ts) -> float:
+    """将异构时间戳（ISO 字符串、Unix 秒/毫秒）规范为可比较的秒数。"""
+    if ts is None:
+        return 0.0
+    if isinstance(ts, (int, float)):
+        v = float(ts)
+        return v / 1000.0 if v > 1e11 else v
+    if isinstance(ts, str):
+        s = ts.strip()
+        if not s:
+            return 0.0
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return 0.0
+    return 0.0
+
+
+def _conversation_sort_key(c: dict) -> tuple[float, str]:
+    """新到旧排序；同时间戳用 id 稳定排序。"""
+    return (-_timestamp_sort_value(c.get("timestamp")), str(c.get("id") or ""))
+
+
 def build_index(archive_dir: Path) -> dict:
     """增量构建索引。
 
-    对比已有索引中的文件指纹，仅重新解析变更/新增的文件。
+    通过各 Adapter 的 archive_sessions() 枚举归档，仅重新解析变更/新增的文件。
     保留已有条目的 distill_state 等状态字段。
     """
     archive_path = archive_dir / "archive"
     if not archive_path.is_dir():
-        return {"conversations": [], "built_at": datetime.now(timezone.utc).isoformat(),
-                "stats": {"new": 0, "updated": 0, "unchanged": 0, "removed": 0}}
+        return {
+            "conversations": [],
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "stats": {"new": 0, "updated": 0, "unchanged": 0, "removed": 0},
+        }
 
-    # 加载已有索引，构建 id → entry 映射
     index_path = archive_dir / INDEX_FILE
-    old_entries = {}
+    old_entries: dict[str, dict] = {}
     if index_path.exists():
         try:
             old_index = json.loads(index_path.read_text(encoding="utf-8"))
@@ -1003,133 +418,58 @@ def build_index(archive_dir: Path) -> dict:
         except Exception:
             pass
 
-    conversations = []
-    seen_ids = set()
+    conversations: list[dict] = []
+    seen_ids: set[str] = set()
     stats = {"new": 0, "updated": 0, "unchanged": 0, "removed": 0}
 
-    # ── JSONL 类型（Cursor / Claude / claude-internal / CodeBuddy 插件）──
-    for jsonl_file in sorted(archive_path.rglob("*.jsonl")):
-        if "subagents" in str(jsonl_file):
-            continue
-
-        rel = jsonl_file.relative_to(archive_path)
-        parts = rel.parts
-        if len(parts) < 2:
-            continue
-
-        tool_name = _detect_tool_from_path(parts)
-        if tool_name not in ("cursor", "codebuddy", "claude", "claude-internal"):
-            continue
-
-        conv_id = jsonl_file.stem
-        if conv_id in seen_ids:
-            continue
-        seen_ids.add(conv_id)
-
-        fingerprint = _file_fingerprint(jsonl_file)
-        old = old_entries.get(conv_id)
-
-        # 指纹未变 → 直接复用旧条目
-        if old and old.get("_fingerprint") == fingerprint:
-            conversations.append(old)
-            stats["unchanged"] += 1
-            continue
-
-        # 指纹变了或新文件 → 重新解析
-        if tool_name == "cursor":
-            parsed = parse_cursor_jsonl(jsonl_file)
-        elif tool_name == "codebuddy":
-            parsed = parse_codebuddy_jsonl(jsonl_file)
-        else:
-            parsed = parse_claude_jsonl(jsonl_file)
-
-        if not parsed:
-            continue
-
-        host, project = _extract_host_project(parts)
-
-        entry = {
-            "id": conv_id,
-            "source": parsed["source"],
-            "tool": tool_name,
-            "file": str(jsonl_file),
-            "title": parsed["title"],
-            "first_question": parsed["first_question"],
-            "turn_count": parsed["turn_count"],
-            "user_turns": parsed["user_turns"],
-            "assistant_turns": parsed["assistant_turns"],
-            "host": host,
-            "project": project,
-            "_fingerprint": fingerprint,
-        }
-        if parsed.get("timestamp"):
-            entry["timestamp"] = parsed["timestamp"]
-        if parsed.get("cwd"):
-            entry["cwd"] = parsed["cwd"]
-
-        _apply_distill_state(entry, old, parsed["turn_count"])
-        entry["worth"] = _compute_worth(entry)
-        if entry["worth"] == "auto_skip" and entry.get("distill_state") == "pending":
-            entry["distill_state"] = "skipped"
-            entry["skip_reason"] = "auto: too short or system command"
-        stats["updated" if old else "new"] += 1
-        conversations.append(entry)
-
-    # ── CodeBuddy IDE（目录结构）──
-    cb_ide_archive = archive_path / "codebuddy-ide"
-    if cb_ide_archive.is_dir():
-        for workspace_dir in cb_ide_archive.iterdir():
-            if not workspace_dir.is_dir():
+    for adapter in ADAPTERS:
+        for path, project, host in adapter.archive_sessions(archive_dir):
+            conv_id = path.stem if path.is_file() else path.name
+            if conv_id in seen_ids:
                 continue
-            for conv_dir in workspace_dir.iterdir():
-                if not conv_dir.is_dir():
-                    continue
-                if not (conv_dir / "index.json").exists():
-                    continue
+            seen_ids.add(conv_id)
 
-                conv_id = conv_dir.name
-                if conv_id in seen_ids:
-                    continue
-                seen_ids.add(conv_id)
+            fingerprint = adapter.fingerprint(path)
+            old = old_entries.get(conv_id)
 
-                fingerprint = _dir_fingerprint(conv_dir)
-                old = old_entries.get(conv_id)
+            # 指纹未变 → 直接复用旧条目
+            if old and old.get("_fingerprint") == fingerprint:
+                conversations.append(old)
+                stats["unchanged"] += 1
+                continue
 
-                if old and old.get("_fingerprint") == fingerprint:
-                    conversations.append(old)
-                    stats["unchanged"] += 1
-                    continue
+            parsed = adapter.parse(path)
+            if not parsed:
+                continue
 
-                parsed = parse_codebuddy_ide_session(conv_dir)
-                if not parsed:
-                    continue
+            entry: dict = {
+                "id": conv_id,
+                "source": parsed.get("source", adapter.tool_name),
+                "tool": adapter.tool_name,
+                "file": str(path),
+                "title": parsed["title"],
+                "first_question": parsed["first_question"],
+                "turn_count": parsed["turn_count"],
+                "user_turns": parsed["user_turns"],
+                "assistant_turns": parsed["assistant_turns"],
+                "host": host,
+                "project": project,
+                "_fingerprint": fingerprint,
+            }
+            if parsed.get("timestamp"):
+                entry["timestamp"] = parsed["timestamp"]
+            if parsed.get("cwd"):
+                entry["cwd"] = parsed["cwd"]
 
-                entry = {
-                    "id": conv_id,
-                    "source": "codebuddy-ide",
-                    "tool": "codebuddy-ide",
-                    "file": str(conv_dir),
-                    "title": parsed["title"],
-                    "first_question": parsed["first_question"],
-                    "turn_count": parsed["turn_count"],
-                    "user_turns": parsed["user_turns"],
-                    "assistant_turns": parsed["assistant_turns"],
-                    "host": "localhost",
-                    "project": workspace_dir.name,
-                    "_fingerprint": fingerprint,
-                }
-                if parsed.get("timestamp"):
-                    entry["timestamp"] = parsed["timestamp"]
+            _apply_distill_state(entry, old, parsed["turn_count"])
+            entry["worth"] = _compute_worth(entry)
+            if entry["worth"] == "auto_skip" and entry.get("distill_state") == "pending":
+                entry["distill_state"] = "skipped"
+                entry["skip_reason"] = "auto: too short or system command"
+            stats["updated" if old else "new"] += 1
+            conversations.append(entry)
 
-                _apply_distill_state(entry, old, parsed["turn_count"])
-                entry["worth"] = _compute_worth(entry)
-                if entry["worth"] == "auto_skip" and entry.get("distill_state") == "pending":
-                    entry["distill_state"] = "skipped"
-                    entry["skip_reason"] = "auto: too short or system command"
-                stats["updated" if old else "new"] += 1
-                conversations.append(entry)
-
-    # 对于缓存命中的旧条目，如果还没有 worth 字段，补算一次
+    # 对缓存命中的旧条目补算 worth
     for conv in conversations:
         if "worth" not in conv:
             conv["worth"] = _compute_worth(conv)
@@ -1137,14 +477,8 @@ def build_index(archive_dir: Path) -> dict:
                 conv["distill_state"] = "skipped"
                 conv["skip_reason"] = "auto: too short or system command"
 
-    # 统计被删除的条目
     stats["removed"] = len(set(old_entries.keys()) - seen_ids)
-
-    # 按时间戳排序
-    conversations.sort(
-        key=lambda c: c.get("timestamp", c.get("id", "")),
-        reverse=True,
-    )
+    conversations.sort(key=_conversation_sort_key)
 
     index = {
         "conversations": conversations,
@@ -1152,130 +486,28 @@ def build_index(archive_dir: Path) -> dict:
         "built_at": datetime.now(timezone.utc).isoformat(),
         "stats": stats,
     }
-
     archive_dir.mkdir(parents=True, exist_ok=True)
     index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
-
     return index
-
-
-def _detect_tool_from_path(parts: tuple) -> str:
-    """从归档路径推断工具类型。"""
-    for p in parts:
-        if p in ("cursor", "claude", "claude-internal", "codebuddy"):
-            return p
-        if "cursor" in p.lower():
-            return "cursor"
-        if "claude-internal" in p.lower():
-            return "claude-internal"
-        if "claude" in p.lower():
-            return "claude"
-        if "codebuddy" in p.lower():
-            return "codebuddy"
-    return "unknown"
-
-
-def _extract_host_project(parts: tuple) -> tuple[str, str]:
-    """从归档路径推断主机名和项目名。"""
-    if parts[0] in ("cursor", "claude", "claude-internal", "codebuddy"):
-        host = "localhost"
-        project = parts[1] if len(parts) > 1 else "unknown"
-    else:
-        host = parts[0]
-        project = parts[2] if len(parts) > 2 else parts[1] if len(parts) > 1 else "unknown"
-    return host, project
 
 
 # ═══════════════════════════════════════
 # CLI 命令实现
 # ═══════════════════════════════════════
 
-def cmd_scan(args):
-    """扫描本地和远程的 AI 对话文件。"""
-    print(bold("扫描 AI 对话文件...\n"))
-
-    # 本地扫描
-    local = scan_local()
-    print(f"  {green('localhost')}")
-    if local["sources"]:
-        for src in local["sources"]:
-            tool_label = _tool_display(src["tool"])
-            print(f"    {tool_label}: {cyan(str(src['count']))} 条对话")
-            if args.verbose:
-                for proj in src.get("projects", []):
-                    print(f"      {dim(proj['name'])}: {proj['count']}")
-    else:
-        print(f"    {dim('未发现对话文件')}")
-    print()
-
-    # 远程扫描
-    hosts = args.remote or []
-    if not hosts and args.all_remotes:
-        hosts = load_ssh_hosts()
-
-    for host in hosts:
-        print(f"  {green(host)} ", end="", flush=True)
-        remote = scan_remote(host)
-        if remote["error"]:
-            print(f"{red('✗')} {remote['error']}")
-        elif remote["sources"]:
-            print()
-            for src in remote["sources"]:
-                tool_label = _tool_display(src["tool"])
-                print(f"    {tool_label}: {cyan(str(src['count']))} 条对话")
-        else:
-            print(f"{dim('无对话文件')}")
-
-    total = local["total_files"] + sum(
-        scan_remote(h).get("total_files", 0) for h in hosts
-    ) if hosts else local["total_files"]
-    print(f"\n{bold('总计')}: {total} 条对话文件")
-
-
-def cmd_collect(args):
-    """收集对话文件到本地归档。"""
-    archive_dir = Path(args.archive_dir)
-    print(bold(f"收集对话到 {archive_dir}/archive/\n"))
-
-    # 本地收集
-    print(f"  {green('localhost')} ... ", end="", flush=True)
-    local_results = collect_local(archive_dir)
-    tools_count = {}
-    for r in local_results:
-        tools_count[r["tool"]] = tools_count.get(r["tool"], 0) + 1
-    if tools_count:
-        parts = [f"{_tool_display(t)}: {c}" for t, c in sorted(tools_count.items())]
-        print(", ".join(parts))
-    else:
-        print(dim("无新文件"))
-
-    # 远程收集
-    hosts = args.remote or []
-    for host in hosts:
-        print(f"  {green(host)} ... ", end="", flush=True)
-        remote_results = collect_remote(host, archive_dir)
-        parts = []
-        for r in remote_results:
-            if r["files_synced"] > 0:
-                parts.append(f"{_tool_display(r['tool'])}: {r['files_synced']}")
-        if parts:
-            print(", ".join(parts))
-        else:
-            print(dim("无新文件"))
-
-    # 构建索引
-    print(f"\n  构建索引 ... ", end="", flush=True)
-    index = build_index(archive_dir)
-    _print_index_stats(index)
-
-
-def cmd_index(args):
-    """重建索引。"""
-    archive_dir = Path(args.archive_dir)
-    print(bold("构建索引...\n"))
-    index = build_index(archive_dir)
-    _print_index_stats(index)
-    print(f"  索引文件: {archive_dir / INDEX_FILE}")
+def _tool_display(tool: str) -> str:
+    """返回带颜色的工具显示标签。"""
+    adapter = ADAPTER_BY_NAME.get(tool)
+    if not adapter:
+        return tool
+    color_fns = {
+        "cursor": cyan,
+        "claude": green,
+        "claude-internal": green,
+        "codebuddy": yellow,
+        "codebuddy-ide": yellow,
+    }
+    return color_fns.get(tool, lambda x: x)(adapter.label)
 
 
 def _print_index_stats(index: dict):
@@ -1294,6 +526,86 @@ def _print_index_stats(index: dict):
     if detail:
         parts.append(f"({', '.join(detail)})")
     print(" ".join(parts))
+
+
+def cmd_scan(args):
+    """扫描本地和远程的 AI 对话文件。"""
+    hosts, remote_scope = resolve_remote_hosts(args)
+    print(bold("扫描 AI 对话文件...\n"))
+    print(dim(f"  扫描范围: 本机 localhost；远程 — {remote_scope}"))
+    print()
+
+    local = scan_local()
+    print(f"  {green('localhost')}")
+    if local["sources"]:
+        for src in local["sources"]:
+            tool_label = _tool_display(src["tool"])
+            print(f"    {tool_label}: {cyan(str(src['count']))} 条对话")
+            if args.verbose:
+                for proj in src.get("projects", []):
+                    print(f"      {dim(proj['name'])}: {proj['count']}")
+    else:
+        print(f"    {dim('未发现对话文件')}")
+    print()
+
+    remote_files_total = 0
+    for host in hosts:
+        print(f"  {green(host)} ", end="", flush=True)
+        remote = scan_remote(host)
+        remote_files_total += remote.get("total_files", 0)
+        if remote["error"]:
+            print(f"{red('✗')} {remote['error']}")
+        elif remote["sources"]:
+            print()
+            for src in remote["sources"]:
+                print(f"    {_tool_display(src['tool'])}: {cyan(str(src['count']))} 条对话")
+        else:
+            print(f"{dim('无对话文件')}")
+
+    total = local["total_files"] + remote_files_total
+    print(f"\n{bold('总计')}: {total} 条对话文件")
+
+
+def cmd_collect(args):
+    """收集对话文件到本地归档。"""
+    archive_dir = Path(args.archive_dir)
+    hosts, remote_scope = resolve_remote_hosts(args)
+    print(bold(f"收集对话到 {archive_dir}/archive/\n"))
+    print(dim(f"  收集范围: 本机 localhost；远程 — {remote_scope}"))
+    print()
+
+    print(f"  {green('localhost')} ... ", end="", flush=True)
+    local_results = collect_local(archive_dir)
+    tools_count: dict[str, int] = {}
+    for r in local_results:
+        tools_count[r["tool"]] = tools_count.get(r["tool"], 0) + 1
+    if tools_count:
+        parts = [f"{_tool_display(t)}: {c}" for t, c in sorted(tools_count.items())]
+        print(", ".join(parts))
+    else:
+        print(dim("无新文件"))
+
+    for host in hosts:
+        print(f"  {green(host)} ... ", end="", flush=True)
+        remote_results = collect_remote(host, archive_dir)
+        parts = [
+            f"{_tool_display(r['tool'])}: {r['files_synced']}"
+            for r in remote_results if r["files_synced"] > 0
+        ]
+        print(", ".join(parts) if parts else dim("无新文件"))
+
+    print(f"\n  构建索引 ... ", end="", flush=True)
+    index = build_index(archive_dir)
+    _print_index_stats(index)
+
+
+def cmd_index(args):
+    """重建索引。"""
+    archive_dir = Path(args.archive_dir)
+    print(bold("构建索引...\n"))
+    index = build_index(archive_dir)
+    _print_index_stats(index)
+    print(f"  索引文件: {archive_dir / INDEX_FILE}")
 
 
 def cmd_list(args):
@@ -1321,20 +633,20 @@ def cmd_list(args):
 
     # 时间过滤
     since_dt = None
-    if getattr(args, 'since', None):
+    if getattr(args, "since", None):
         try:
             since_dt = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
         except ValueError:
             print(red(f"无效日期格式: {args.since}，请用 YYYY-MM-DD"))
             return
-    elif getattr(args, 'days', None):
+    elif getattr(args, "days", None):
         since_dt = datetime.now(timezone.utc) - timedelta(days=args.days)
 
     if since_dt:
-        since_iso = since_dt.isoformat()
+        since_threshold = since_dt.timestamp()
         conversations = [
             c for c in conversations
-            if (c.get("timestamp") or "") >= since_iso
+            if _timestamp_sort_value(c.get("timestamp")) >= since_threshold
         ]
 
     if args.query:
@@ -1349,9 +661,27 @@ def cmd_list(args):
         print(dim("未找到匹配的对话"))
         return
 
-    # 分页
+    filter_bits = []
+    if args.source:
+        filter_bits.append(f"工具={args.source}")
+    if args.host:
+        filter_bits.append(f"主机={args.host}")
+    if args.state:
+        filter_bits.append(f"状态={args.state}")
+    if args.pending:
+        filter_bits.append("待提炼")
+    if getattr(args, "since", None):
+        filter_bits.append(f"since={args.since}")
+    if getattr(args, "days", None):
+        filter_bits.append(f"近 {args.days} 天")
+    if args.query:
+        filter_bits.append(f"关键词={args.query!r}")
+    if filter_bits:
+        print(dim("  列表筛选: " + " · ".join(filter_bits)))
+        print()
+
     total_count = len(conversations)
-    offset = getattr(args, 'offset', 0) or 0
+    offset = getattr(args, "offset", 0) or 0
     limit = args.limit or 20
     page = conversations[offset:offset + limit]
 
@@ -1365,7 +695,9 @@ def cmd_list(args):
         tool = _tool_display(conv.get("tool", "?"))
         title = conv.get("title", "Untitled")
         turns = dim(f"({conv.get('turn_count', '?')} turns)")
-        host = dim(f"@{conv.get('host', '?')}")
+        host = conv.get("host", "?")
+        proj = _short_label(conv.get("project") or "—")
+        origin = dim(f"@{host} / {proj}")
 
         state = conv.get("distill_state", "")
         state_tag = ""
@@ -1373,11 +705,11 @@ def cmd_list(args):
             state_tag = green(" ✔")
         elif state == "outdated":
             prev = conv.get("_prev_turn_count", "?")
-            state_tag = yellow(f" ↑{conv.get('turn_count',0)-prev if isinstance(prev,int) else '?'}")
+            state_tag = yellow(f" ↑{conv.get('turn_count', 0) - prev if isinstance(prev, int) else '?'}")
         elif state == "pending":
             state_tag = dim(" ·")
 
-        print(f"  {idx} {tool} {bold(title)} {turns} {host}{state_tag}")
+        print(f"  {idx} {tool} {origin} {bold(title)} {turns}{state_tag}")
 
     if offset + limit < total_count:
         next_offset = offset + limit
@@ -1396,7 +728,6 @@ def cmd_show(args):
     index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
 
-    # 按编号或 ID 查找
     target = args.id
     conv = None
     if target.isdigit():
@@ -1410,32 +741,34 @@ def cmd_show(args):
         print(red(f"未找到对话: {target}"))
         return
 
-    # 解析并显示完整对话
     filepath = Path(conv["file"])
     if not filepath.exists():
         print(red(f"文件不存在: {filepath}"))
         return
 
     tool = conv.get("tool", "unknown")
-    if tool == "cursor":
-        parsed = parse_cursor_jsonl(filepath)
-    elif tool == "codebuddy-ide":
-        parsed = parse_codebuddy_ide_session(filepath)
-    elif tool == "codebuddy":
-        parsed = parse_codebuddy_jsonl(filepath)
-    else:
-        parsed = parse_claude_jsonl(filepath)
+    adapter = ADAPTER_BY_NAME.get(tool)
+    if not adapter:
+        print(red(f"未知工具类型: {tool}"))
+        return
 
+    parsed = adapter.parse(filepath)
     if not parsed:
         print(red("解析失败"))
         return
 
     print(bold(f"\n{'═' * 60}"))
     print(bold(f"  {parsed['title']}"))
-    print(f"  {_tool_display(tool)} | {dim(conv.get('host', '?'))} | {parsed['turn_count']} turns")
+    proj = conv.get("project") or "—"
+    print(
+        f"  {_tool_display(tool)} | "
+        f"{dim('主机:')} {conv.get('host', '?')} | "
+        f"{dim('项目:')} {proj} | "
+        f"{parsed['turn_count']} turns"
+    )
     print(bold(f"{'═' * 60}\n"))
 
-    full_mode = getattr(args, 'full', False)
+    full_mode = getattr(args, "full", False)
     for turn in parsed["turns"]:
         role_label = green("  User") if turn["role"] == "user" else blue("  AI")
         print(f"{role_label}:")
@@ -1463,21 +796,20 @@ def cmd_stats(args):
     print(f"  总对话数: {green(str(len(conversations)))}")
     print(f"  索引时间: {dim(index.get('built_at', '?'))}")
 
-    # 提炼状态
-    by_state = {}
+    by_state: dict[str, int] = {}
     for c in conversations:
         s = c.get("distill_state", "pending")
         by_state[s] = by_state.get(s, 0) + 1
     state_labels = {"pending": "待提炼", "done": "已提炼", "outdated": "有更新", "skipped": "已跳过"}
-    state_parts = []
-    for s in ["pending", "outdated", "done", "skipped"]:
-        if by_state.get(s):
-            state_parts.append(f"{state_labels.get(s, s)}: {by_state[s]}")
+    state_parts = [
+        f"{state_labels.get(s, s)}: {by_state[s]}"
+        for s in ["pending", "outdated", "done", "skipped"]
+        if by_state.get(s)
+    ]
     if state_parts:
         print(f"  提炼状态: {', '.join(state_parts)}")
 
-    # 按工具统计
-    by_tool = {}
+    by_tool: dict[str, int] = {}
     for c in conversations:
         t = c.get("tool", "unknown")
         by_tool[t] = by_tool.get(t, 0) + 1
@@ -1485,8 +817,7 @@ def cmd_stats(args):
     for tool, count in sorted(by_tool.items(), key=lambda x: -x[1]):
         print(f"    {_tool_display(tool)}: {count}")
 
-    # 按主机统计
-    by_host = {}
+    by_host: dict[str, int] = {}
     for c in conversations:
         h = c.get("host", "unknown")
         by_host[h] = by_host.get(h, 0) + 1
@@ -1494,8 +825,7 @@ def cmd_stats(args):
     for host, count in sorted(by_host.items(), key=lambda x: -x[1]):
         print(f"    {host}: {count}")
 
-    # 按项目统计（前 10）
-    by_project = {}
+    by_project: dict[str, int] = {}
     for c in conversations:
         p = c.get("project", "unknown")
         by_project[p] = by_project.get(p, 0) + 1
@@ -1509,7 +839,7 @@ def cmd_stats(args):
 def cmd_triage(args):
     """输出待提炼对话的摘要，供 AI 批量判值。
 
-    输出紧凑的 JSON 数组，每条包含 id、title、first_question、turn_count、tool、host，
+    输出紧凑的 JSON 数组，每条包含 id、title、first_question、turns、tool、host、project，
     方便 AI 一次性扫描并决定哪些值得深入阅读。
     """
     archive_dir = Path(args.archive_dir)
@@ -1521,17 +851,14 @@ def cmd_triage(args):
 
     index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
-
-    pending = [c for c in conversations
-               if c.get("distill_state") in ("pending", "outdated")]
+    pending = [c for c in conversations if c.get("distill_state") in ("pending", "outdated")]
 
     if not pending:
         print(json.dumps({"pending": 0, "items": []}, ensure_ascii=False))
         return
 
-    items = []
-    for c in pending:
-        items.append({
+    items = [
+        {
             "id": c["id"],
             "idx": conversations.index(c) + 1,
             "title": c.get("title", "")[:100],
@@ -1539,22 +866,12 @@ def cmd_triage(args):
             "turns": c.get("turn_count", 0),
             "tool": c.get("tool", ""),
             "host": c.get("host", ""),
+            "project": c.get("project", ""),
             "state": c.get("distill_state", ""),
-        })
-
-    result = {"pending": len(items), "items": items}
-    print(json.dumps(result, ensure_ascii=False, indent=2))
-
-
-def _tool_display(tool: str) -> str:
-    labels = {
-        "cursor": cyan("▶ Cursor"),
-        "claude": green("◆ Claude"),
-        "claude-internal": green("◆ claude-internal"),
-        "codebuddy": yellow("★ CodeBuddy"),
-        "codebuddy-ide": yellow("★ CodeBuddy IDE"),
-    }
-    return labels.get(tool, tool)
+        }
+        for c in pending
+    ]
+    print(json.dumps({"pending": len(items), "items": items}, ensure_ascii=False, indent=2))
 
 
 # ═══════════════════════════════════════
@@ -1566,17 +883,34 @@ def _update_index_entries(archive_dir: Path, updates_map: dict[str, dict]) -> li
     index_path = archive_dir / INDEX_FILE
     if not index_path.exists():
         return []
-
     index = json.loads(index_path.read_text(encoding="utf-8"))
     updated = []
     for conv in index["conversations"]:
         if conv["id"] in updates_map:
             conv.update(updates_map[conv["id"]])
             updated.append(conv["id"])
-
     if updated:
         index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
     return updated
+
+
+def _resolve_conv_ids(archive_dir: Path, targets: list[str]) -> list[str]:
+    """将多个编号或 ID 批量解析为 conv_id 列表。"""
+    index_path = archive_dir / INDEX_FILE
+    if not index_path.exists():
+        return []
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    conversations = index.get("conversations", [])
+    all_ids = {c["id"] for c in conversations}
+    resolved = []
+    for target in targets:
+        if target.isdigit():
+            idx = int(target) - 1
+            if 0 <= idx < len(conversations):
+                resolved.append(conversations[idx]["id"])
+        elif target in all_ids:
+            resolved.append(target)
+    return resolved
 
 
 def cmd_done(args):
@@ -1591,10 +925,7 @@ def cmd_done(args):
     now = datetime.now(timezone.utc).isoformat()
     updates_map = {}
     for cid in conv_ids:
-        entry_updates = {
-            "distill_state": "done",
-            "distilled_at": now,
-        }
+        entry_updates: dict = {"distill_state": "done", "distilled_at": now}
         if channels:
             entry_updates["channels"] = channels
         if args.note_title:
@@ -1605,8 +936,7 @@ def cmd_done(args):
     ch_info = f" → {', '.join(channels)}" if channels else ""
     for cid in updated:
         print(green(f"✔ done: {cid}{ch_info}"))
-    failed = set(conv_ids) - set(updated)
-    for cid in failed:
+    for cid in set(conv_ids) - set(updated):
         print(red(f"更新失败: {cid}"))
 
 
@@ -1621,10 +951,7 @@ def cmd_skip(args):
     now = datetime.now(timezone.utc).isoformat()
     updates_map = {}
     for cid in conv_ids:
-        entry_updates = {
-            "distill_state": "skipped",
-            "distilled_at": now,
-        }
+        entry_updates: dict = {"distill_state": "skipped", "distilled_at": now}
         if args.reason:
             entry_updates["skip_reason"] = args.reason
         updates_map[cid] = entry_updates
@@ -1632,8 +959,7 @@ def cmd_skip(args):
     updated = _update_index_entries(archive_dir, updates_map)
     for cid in updated:
         print(dim(f"⊘ skipped: {cid}"))
-    failed = set(conv_ids) - set(updated)
-    for cid in failed:
+    for cid in set(conv_ids) - set(updated):
         print(red(f"更新失败: {cid}"))
 
 
@@ -1645,43 +971,21 @@ def cmd_reset(args):
         print(red(f"未找到对话: {', '.join(args.ids)}"))
         return
 
-    updates_map = {}
-    for cid in conv_ids:
-        updates_map[cid] = {
+    updates_map = {
+        cid: {
             "distill_state": "pending",
             "distilled_at": None,
             "skip_reason": None,
             "channels": None,
             "note_title": None,
         }
-
+        for cid in conv_ids
+    }
     updated = _update_index_entries(archive_dir, updates_map)
     for cid in updated:
         print(yellow(f"↺ reset to pending: {cid}"))
-    failed = set(conv_ids) - set(updated)
-    for cid in failed:
+    for cid in set(conv_ids) - set(updated):
         print(red(f"更新失败: {cid}"))
-
-
-def _resolve_conv_ids(archive_dir: Path, targets: list[str]) -> list[str]:
-    """将多个编号或 ID 批量解析为 conv_id 列表。"""
-    index_path = archive_dir / INDEX_FILE
-    if not index_path.exists():
-        return []
-
-    index = json.loads(index_path.read_text(encoding="utf-8"))
-    conversations = index.get("conversations", [])
-    all_ids = {c["id"] for c in conversations}
-
-    resolved = []
-    for target in targets:
-        if target.isdigit():
-            idx = int(target) - 1
-            if 0 <= idx < len(conversations):
-                resolved.append(conversations[idx]["id"])
-        elif target in all_ids:
-            resolved.append(target)
-    return resolved
 
 
 # ═══════════════════════════════════════
@@ -1702,13 +1006,23 @@ def main():
 
     # scan
     p_scan = sub.add_parser("scan", help="扫描 AI 对话文件")
-    p_scan.add_argument("--remote", nargs="*", help="远程 SSH 主机名")
-    p_scan.add_argument("--all-remotes", action="store_true", help="扫描 ~/.ssh/config 中所有主机")
+    p_scan.add_argument("--local-only", action="store_true", help="仅本机，不通过 SSH 扫远程")
+    p_scan.add_argument(
+        "--remote", nargs="*", default=None, metavar="HOST",
+        help="仅扫描这些 SSH 主机；不写主机名则不扫远程。默认扫 ~/.ssh/config 中全部 Host",
+    )
+    p_scan.add_argument("--all-remotes", action="store_true",
+                        help="已废弃：与默认行为相同（默认即会扫全部 SSH Host）")
     p_scan.add_argument("-v", "--verbose", action="store_true")
 
     # collect
     p_collect = sub.add_parser("collect", help="收集对话到本地归档")
-    p_collect.add_argument("--remote", nargs="*", help="远程 SSH 主机名")
+    p_collect.add_argument("--local-only", action="store_true", help="仅本机，不从远程 rsync")
+    p_collect.add_argument(
+        "--remote", nargs="*", default=None, metavar="HOST",
+        help="仅从所列主机同步；不写主机名则不同步远程。默认同步 ~/.ssh/config 中全部 Host",
+    )
+    p_collect.add_argument("--all-remotes", action="store_true", help="已废弃：与默认行为相同")
     p_collect.add_argument("-v", "--verbose", action="store_true")
 
     # index
@@ -1753,13 +1067,12 @@ def main():
     p_reset.add_argument("ids", nargs="+", help="对话编号或 ID（可传多个）")
 
     args = parser.parse_args()
-
     if not args.command:
         parser.print_help()
         return
 
     global _verbose
-    _verbose = getattr(args, 'verbose', False)
+    _verbose = getattr(args, "verbose", False)
 
     commands = {
         "scan": cmd_scan,
