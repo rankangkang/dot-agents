@@ -13,10 +13,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shlex
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .base import (
+    KNOWN_TOOL_DIRS,
     ToolAdapter,
     SKIP_FOR_TITLE_RE,
     USER_QUERY_RE,
@@ -85,20 +88,35 @@ class CodeBuddyIDEAdapter(ToolAdapter):
         self._copy_dir_if_newer(src, dest)
         return dest
 
-    def archive_sessions(self, archive_dir: Path) -> list[tuple[Path, str, str]]:
+    def _sessions_under_cb_root(self, cb_root: Path, host: str) -> list[tuple[Path, str, str]]:
         sessions: list[tuple[Path, str, str]] = []
-        cb_archive = archive_dir / "archive" / "codebuddy-ide"
-        if not cb_archive.is_dir():
-            return []
-        for workspace_dir in cb_archive.iterdir():
+        if not cb_root.is_dir():
+            return sessions
+        for workspace_dir in cb_root.iterdir():
             if not workspace_dir.is_dir():
                 continue
             for conv_dir in workspace_dir.iterdir():
                 if not conv_dir.is_dir():
                     continue
                 if (conv_dir / "index.json").exists():
-                    sessions.append((conv_dir, workspace_dir.name, "localhost"))
+                    sessions.append((conv_dir, workspace_dir.name, host))
         return sessions
+
+    def archive_sessions(self, archive_dir: Path) -> list[tuple[Path, str, str]]:
+        out: list[tuple[Path, str, str]] = []
+        out.extend(
+            self._sessions_under_cb_root(
+                archive_dir / "archive" / "codebuddy-ide", "localhost"
+            )
+        )
+        archive = archive_dir / "archive"
+        if archive.is_dir():
+            for host_dir in sorted(archive.iterdir()):
+                if not host_dir.is_dir() or host_dir.name in KNOWN_TOOL_DIRS:
+                    continue
+                tool_dir = host_dir / "codebuddy-ide"
+                out.extend(self._sessions_under_cb_root(tool_dir, host_dir.name))
+        return out
 
     # ── 指纹（目录哈希）──────────────────────────────────────────────────────
 
@@ -213,4 +231,110 @@ class CodeBuddyIDEAdapter(ToolAdapter):
             "turns": turns,
         }
 
-    # CodeBuddy IDE 暂不支持远程 SSH 扫描和 rsync（remote_* 返回默认 None）
+    # ── 远程（SSH / rsync 目录树）────────────────────────────────────────────
+
+    def remote_section_marker(self) -> str:
+        return "__CODEBUDDY_IDE__"
+
+    def remote_find_cmd(self) -> str:
+        # Linux: .../CodeBuddyIDE/.../history/{workspace}/{conv}/index.json
+        # macOS: .../Data/.../history/{workspace}/{conv}/index.json
+        return (
+            "("
+            "find \"$HOME/.local/share/CodeBuddyExtension/Data\" "
+            "-path '*/CodeBuddyIDE/*/history/*/*/index.json' 2>/dev/null; "
+            "find \"$HOME/Library/Application Support/CodeBuddyExtension/Data\" "
+            "-path '*/history/*/*/index.json' 2>/dev/null"
+            ") | head -200"
+        )
+
+    def _remote_history_roots_shell(self) -> str:
+        """在远程 shell 中输出各 history 根目录（每行一个绝对路径）。"""
+        return (
+            r'for d in "$HOME"/.local/share/CodeBuddyExtension/Data/*/CodeBuddyIDE/*/history; do '
+            r'[ -d "$d" ] && printf "%s\n" "$d"; done; '
+            r'if [ -d "$HOME/Library/Application Support/CodeBuddyExtension/Data" ]; then '
+            r'find "$HOME/Library/Application Support/CodeBuddyExtension/Data" -type d '
+            r'-name history 2>/dev/null; fi'
+        )
+
+    @staticmethod
+    def _count_rsync_transferred_files(stdout: str) -> int:
+        return sum(
+            1
+            for line in stdout.splitlines()
+            if line.strip().endswith(".json")
+        )
+
+    def remote_sync(self, host: str, archive_dir: Path, timeout: int = 180) -> list[dict] | None:
+        """将远程 history 目录树 rsync 到 archive/{host}/codebuddy-ide/。"""
+        local_dest = archive_dir / "archive" / host / "codebuddy-ide"
+        local_dest.mkdir(parents=True, exist_ok=True)
+
+        list_cmd = self._remote_history_roots_shell()
+        try:
+            proc = subprocess.run(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", host, list_cmd],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            return [{
+                "host": host,
+                "tool": self.tool_name,
+                "status": "error",
+                "files_synced": 0,
+                "message": str(e)[:200],
+            }]
+
+        roots = sorted({ln.strip() for ln in proc.stdout.splitlines() if ln.strip()})
+        if not roots and proc.returncode != 0:
+            return [{
+                "host": host,
+                "tool": self.tool_name,
+                "status": "error",
+                "files_synced": 0,
+                "message": (proc.stderr or proc.stdout or "")[:200],
+            }]
+        if not roots:
+            return [{
+                "host": host,
+                "tool": self.tool_name,
+                "status": "success",
+                "files_synced": 0,
+                "message": "",
+            }]
+
+        per = max(30, timeout // max(1, len(roots)))
+        total_files = 0
+        last_err = ""
+        for root in roots:
+            remote_spec = f"{host}:{shlex.quote(root.rstrip('/')) + '/'}"
+            try:
+                rp = subprocess.run(
+                    [
+                        "rsync",
+                        "-avz",
+                        remote_spec,
+                        str(local_dest) + "/",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=per,
+                )
+            except (subprocess.TimeoutExpired, OSError) as e:
+                last_err = str(e)[:200]
+                break
+            if rp.returncode != 0:
+                last_err = (rp.stderr or rp.stdout or "")[:200]
+                break
+            total_files += self._count_rsync_transferred_files(rp.stdout)
+
+        return [{
+            "host": host,
+            "tool": self.tool_name,
+            "status": "success" if not last_err else "error",
+            "files_synced": total_files,
+            "message": last_err,
+        }]

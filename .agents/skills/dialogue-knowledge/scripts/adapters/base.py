@@ -133,6 +133,14 @@ class ToolAdapter(ABC):
         """
         return None
 
+    def remote_sync(self, host: str, archive_dir: Path, timeout: int = 180) -> list[dict] | None:
+        """可选：自定义远程收集（如目录树而非 jsonl）。
+
+        返回非 None 时 collect_remote 采用返回的 result dict 列表，并跳过 remote_rsync。
+        默认 None 表示使用 remote_rsync + 内置 jsonl rsync 规则。
+        """
+        return None
+
     # ── 内部辅助 ──────────────────────────────────────────────────────────────
 
     def _copy_file_if_newer(self, src: Path, dest: Path):

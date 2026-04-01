@@ -126,6 +126,11 @@ def load_ssh_hosts() -> list[str]:
     return sorted(set(hosts))
 
 
+def _host_matches_filter(stored: str | None, needle: str) -> bool:
+    """与 list --host 匹配；归档里 host 可能与 ~/.ssh/config 中 Host 大小写不一致。"""
+    return (stored or "").lower() == needle.lower()
+
+
 def resolve_remote_hosts(args) -> tuple[list[str], str]:
     """解析 scan/collect 使用的远程主机列表及人类可读的范围说明。
 
@@ -259,6 +264,11 @@ def collect_remote(host: str, archive_dir: Path, timeout: int = 180) -> list[dic
     results: list[dict] = []
 
     for adapter in ADAPTERS:
+        custom = adapter.remote_sync(host, archive_dir, timeout)
+        if custom is not None:
+            results.extend(custom)
+            continue
+
         rsync_info = adapter.remote_rsync(host, archive_dir)
         if not rsync_info:
             continue
@@ -624,7 +634,7 @@ def cmd_list(args):
     if args.source:
         conversations = [c for c in conversations if c.get("tool") == args.source]
     if args.host:
-        conversations = [c for c in conversations if c.get("host") == args.host]
+        conversations = [c for c in conversations if _host_matches_filter(c.get("host"), args.host)]
     if args.state:
         conversations = [c for c in conversations if c.get("distill_state") == args.state]
     if args.pending:
@@ -1032,7 +1042,7 @@ def main():
     p_list = sub.add_parser("list", help="列出/搜索对话")
     p_list.add_argument("query", nargs="?", help="搜索关键词")
     p_list.add_argument("--source", help="按工具筛选 (cursor/claude/claude-internal/codebuddy)")
-    p_list.add_argument("--host", help="按主机筛选")
+    p_list.add_argument("--host", help="按主机筛选（与 SSH Host 名大小写可不一致）")
     p_list.add_argument("--state", help="按提炼状态筛选 (pending/done/outdated/skipped)")
     p_list.add_argument("--pending", action="store_true", help="仅显示待提炼 (pending + outdated)")
     p_list.add_argument("--limit", type=int, default=20, help="显示条数 (默认 20)")
