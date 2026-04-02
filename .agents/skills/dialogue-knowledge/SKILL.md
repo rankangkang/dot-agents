@@ -1,6 +1,6 @@
 ---
 name: dialogue-knowledge
-description: '从 Cursor/Claude/CodeBuddy 等 AI 编程工具中收集对话记录，用 AI 提炼为结构化笔记，管理个人知识库。触发词：/知识库, /kb, "帮我整理对话", "对话知识库"'
+description: '从 Cursor/Claude/CodeBuddy 等 AI 编程工具中收集对话记录，用 AI 提炼为结构化笔记，管理个人知识库。'
 ---
 
 # AI 对话知识库
