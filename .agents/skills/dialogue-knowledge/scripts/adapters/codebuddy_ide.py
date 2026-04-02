@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -310,7 +309,7 @@ class CodeBuddyIDEAdapter(ToolAdapter):
         total_files = 0
         last_err = ""
         for root in roots:
-            remote_spec = f"{host}:{shlex.quote(root.rstrip('/')) + '/'}"
+            remote_spec = f"{host}:{root.rstrip('/')}/"
             try:
                 rp = subprocess.run(
                     [

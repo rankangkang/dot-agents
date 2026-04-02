@@ -38,7 +38,6 @@ from adapters import ADAPTER_BY_NAME, ADAPTERS  # noqa: E402
 # ── 常量 ─────────────────────────────────────────────────────────────────────
 
 DEFAULT_ARCHIVE_DIR = Path.home() / ".ai-dialogues"
-CONFIG_FILE = "config.yaml"
 INDEX_FILE = "index.json"
 
 # ── 颜色输出 ─────────────────────────────────────────────────────────────────
@@ -67,45 +66,18 @@ def _warn(msg: str):
         print(f"  {dim(f'[warn] {msg}')}", file=sys.stderr)
 
 
-# ═══════════════════════════════════════
-# 配置
-# ═══════════════════════════════════════
-
-def load_config(archive_dir: Path) -> dict:
-    config_path = archive_dir / CONFIG_FILE
-    if not config_path.exists():
-        return {"archive_dir": str(archive_dir), "remotes": []}
-    text = config_path.read_text(encoding="utf-8")
-    return _parse_simple_yaml(text)
-
-
-def save_config(archive_dir: Path, config: dict):
-    config_path = archive_dir / CONFIG_FILE
-    archive_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"archive_dir: {config.get('archive_dir', str(archive_dir))}", ""]
-    if config.get("remotes"):
-        lines.append("remotes:")
-        for remote in config["remotes"]:
-            lines.append(f"  - host: {remote['host']}")
-    config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def _parse_simple_yaml(text: str) -> dict:
-    """极简 YAML 解析器，只处理本项目用到的扁平结构。"""
-    result = {"remotes": []}
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        if ":" not in stripped:
-            continue
-        if stripped.startswith("- host:"):
-            host = stripped.split(":", 1)[1].strip()
-            result["remotes"].append({"host": host})
-        elif not line.startswith(" ") and ":" in stripped:
-            key, val = stripped.split(":", 1)
-            result[key.strip()] = val.strip()
-    return result
+def _load_index(archive_dir: Path) -> dict | None:
+    """安全加载 index.json，失败时打印提示并返回 None。"""
+    index_path = archive_dir / INDEX_FILE
+    if not index_path.exists():
+        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+        return None
+    try:
+        return json.loads(index_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(red(f"索引文件损坏或无法读取: {index_path}\n  {e}"))
+        print(yellow("尝试运行 dialogue-kb index 重建索引"))
+        return None
 
 
 # ═══════════════════════════════════════
@@ -277,10 +249,10 @@ def collect_remote(host: str, archive_dir: Path, timeout: int = 180) -> list[dic
 
         cmd = [
             "rsync", "-avz",
+            "--exclude=subagents/",
             "--include=*/",
             "--include=*.jsonl",
             "--exclude=*",
-            "--exclude=subagents/",
             remote_src,
             str(local_dir) + "/",
         ]
@@ -598,11 +570,24 @@ def cmd_collect(args):
     for host in hosts:
         print(f"  {green(host)} ... ", end="", flush=True)
         remote_results = collect_remote(host, archive_dir)
-        parts = [
+        success_parts = [
             f"{_tool_display(r['tool'])}: {r['files_synced']}"
-            for r in remote_results if r["files_synced"] > 0
+            for r in remote_results
+            if r.get("status") != "error" and r.get("files_synced", 0) > 0
         ]
-        print(", ".join(parts) if parts else dim("无新文件"))
+        error_parts = [
+            f"{_tool_display(r['tool'])}: {r.get('message') or 'unknown error'}"
+            for r in remote_results
+            if r.get("status") == "error"
+        ]
+        if error_parts and success_parts:
+            print(f"{', '.join(success_parts)}; {red('错误')} " + " | ".join(error_parts))
+        elif error_parts:
+            print(f"{red('✗')} " + " | ".join(error_parts))
+        elif success_parts:
+            print(", ".join(success_parts))
+        else:
+            print(dim("无新文件"))
 
     print(f"\n  构建索引 ... ", end="", flush=True)
     index = build_index(archive_dir)
@@ -621,13 +606,9 @@ def cmd_index(args):
 def cmd_list(args):
     """列出/搜索对话。"""
     archive_dir = Path(args.archive_dir)
-    index_path = archive_dir / INDEX_FILE
-
-    if not index_path.exists():
-        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+    index = _load_index(archive_dir)
+    if index is None:
         return
-
-    index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
 
     # 筛选
@@ -729,13 +710,9 @@ def cmd_list(args):
 def cmd_show(args):
     """查看对话详情。"""
     archive_dir = Path(args.archive_dir)
-    index_path = archive_dir / INDEX_FILE
-
-    if not index_path.exists():
-        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+    index = _load_index(archive_dir)
+    if index is None:
         return
-
-    index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
 
     target = args.id
@@ -793,13 +770,9 @@ def cmd_show(args):
 def cmd_stats(args):
     """显示统计信息。"""
     archive_dir = Path(args.archive_dir)
-    index_path = archive_dir / INDEX_FILE
-
-    if not index_path.exists():
-        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+    index = _load_index(archive_dir)
+    if index is None:
         return
-
-    index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
 
     print(bold("\n对话知识库统计\n"))
@@ -853,13 +826,9 @@ def cmd_triage(args):
     方便 AI 一次性扫描并决定哪些值得深入阅读。
     """
     archive_dir = Path(args.archive_dir)
-    index_path = archive_dir / INDEX_FILE
-
-    if not index_path.exists():
-        print(yellow("索引不存在，请先运行: dialogue-kb collect"))
+    index = _load_index(archive_dir)
+    if index is None:
         return
-
-    index = json.loads(index_path.read_text(encoding="utf-8"))
     conversations = index.get("conversations", [])
     pending = [c for c in conversations if c.get("distill_state") in ("pending", "outdated")]
 
@@ -867,10 +836,11 @@ def cmd_triage(args):
         print(json.dumps({"pending": 0, "items": []}, ensure_ascii=False))
         return
 
+    id_to_idx = {c["id"]: i + 1 for i, c in enumerate(conversations)}
     items = [
         {
             "id": c["id"],
-            "idx": conversations.index(c) + 1,
+            "idx": id_to_idx.get(c["id"], 0),
             "title": c.get("title", "")[:100],
             "first_question": c.get("first_question", "")[:150],
             "turns": c.get("turn_count", 0),
@@ -893,7 +863,10 @@ def _update_index_entries(archive_dir: Path, updates_map: dict[str, dict]) -> li
     index_path = archive_dir / INDEX_FILE
     if not index_path.exists():
         return []
-    index = json.loads(index_path.read_text(encoding="utf-8"))
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
     updated = []
     for conv in index["conversations"]:
         if conv["id"] in updates_map:
@@ -909,7 +882,10 @@ def _resolve_conv_ids(archive_dir: Path, targets: list[str]) -> list[str]:
     index_path = archive_dir / INDEX_FILE
     if not index_path.exists():
         return []
-    index = json.loads(index_path.read_text(encoding="utf-8"))
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
     conversations = index.get("conversations", [])
     all_ids = {c["id"] for c in conversations}
     resolved = []

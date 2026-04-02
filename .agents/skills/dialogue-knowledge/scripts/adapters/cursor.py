@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .base import (
+    KNOWN_TOOL_DIRS,
     ToolAdapter,
     USER_QUERY_RE,
     extract_title,
@@ -51,8 +52,58 @@ class CursorAdapter(ToolAdapter):
         self._copy_file_if_newer(src, dest)
         return dest
 
+    def _sessions_under_cursor_root(self, cursor_root: Path, host: str) -> list[tuple[Path, str, str]]:
+        """兼容两种归档布局。
+
+        本机归档是扁平布局:
+          archive/cursor/{project}/{id}.jsonl
+
+        远程 rsync 归档会保留 Cursor 原始目录层级:
+          archive/{host}/cursor/{project}/agent-transcripts/{session}/{id}.jsonl
+        """
+        sessions: list[tuple[Path, str, str]] = []
+        seen: set[Path] = set()
+        if not cursor_root.is_dir():
+            return sessions
+
+        for project_dir in sorted(cursor_root.iterdir()):
+            if not project_dir.is_dir():
+                continue
+
+            for jsonl_file in sorted(project_dir.glob("*.jsonl")):
+                if "subagents" in str(jsonl_file) or jsonl_file in seen:
+                    continue
+                sessions.append((jsonl_file, project_dir.name, host))
+                seen.add(jsonl_file)
+
+            transcripts_dir = project_dir / "agent-transcripts"
+            if not transcripts_dir.is_dir():
+                continue
+            for session_dir in sorted(transcripts_dir.iterdir()):
+                if not session_dir.is_dir():
+                    continue
+                for jsonl_file in sorted(session_dir.glob("*.jsonl")):
+                    if "subagents" in str(jsonl_file) or jsonl_file in seen:
+                        continue
+                    sessions.append((jsonl_file, project_dir.name, host))
+                    seen.add(jsonl_file)
+        return sessions
+
     def archive_sessions(self, archive_dir: Path) -> list[tuple[Path, str, str]]:
-        return self._jsonl_archive_sessions(archive_dir)
+        out = self._sessions_under_cursor_root(
+            archive_dir / "archive" / "cursor", "localhost"
+        )
+        archive = archive_dir / "archive"
+        if archive.is_dir():
+            for host_dir in sorted(archive.iterdir()):
+                if not host_dir.is_dir() or host_dir.name in KNOWN_TOOL_DIRS:
+                    continue
+                out.extend(
+                    self._sessions_under_cursor_root(
+                        host_dir / "cursor", host_dir.name
+                    )
+                )
+        return out
 
     # ── 解析 ──────────────────────────────────────────────────────────────────
 
