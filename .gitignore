@@ -4,3 +4,15 @@
 *~
 .env
 .env.local
+
+.temp/
+__pycache__/
+*.pyc
+
+# SKILL 记忆文件（用户私有偏好）
+**/skills/*/memory.md
+
+temp/
+tmp/
+.temp/
+.tmp/
