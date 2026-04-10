@@ -7,8 +7,8 @@
     "agents:init": "./.agents/scripts/init.sh",
     "agents:init:force": "./.agents/scripts/init.sh --force",
     "agents:init:dry": "./.agents/scripts/init.sh --dry-run",
+    "agents:init:global": "./.agents/scripts/init.sh --global",
     "agents:clean": "./.agents/scripts/init.sh --clean",
-    "agents:global": "./.agents/scripts/init.sh --global",
     "prepare": "./.agents/scripts/init.sh --quiet"
   },
   "keywords": [],
