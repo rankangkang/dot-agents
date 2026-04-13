@@ -9,6 +9,7 @@
     "agents:init:dry": "./.agents/scripts/init.sh --dry-run",
     "agents:init:global": "./.agents/scripts/init.sh --global",
     "agents:clean": "./.agents/scripts/init.sh --clean",
+    "agents:unlink": "./.agents/scripts/init.sh --unlink",
     "prepare": "./.agents/scripts/init.sh --quiet"
   },
   "keywords": [],

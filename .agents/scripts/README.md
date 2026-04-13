@@ -23,6 +23,7 @@ pnpm agents:init
 | `-n, --dry-run`  | 预览变更，不执行实际操作         |
 | `-f, --force`    | 强制修复指向错误的链接           |
 | `-c, --clean`    | 仅清理悬空链接，不创建新链接     |
+| `-u, --unlink`   | 移除所有由 init 创建的符号链接   |
 | `-v, --verbose`  | 显示调试信息                     |
 | `-q, --quiet`    | 静默模式，仅显示变更和错误       |
 | `-h, --help`     | 显示帮助信息                     |
@@ -36,6 +37,8 @@ init.sh skills commands    # 初始化 skills 和 commands
 init.sh --force            # 修复所有指向错误的链接
 init.sh --dry-run          # 预览变更
 init.sh --clean            # 清理悬空链接
+init.sh --unlink           # 移除所有由 init 创建的符号链接
+init.sh --unlink --dry-run # 预览要移除的链接
 init.sh --force --dry-run  # 预览修复操作
 ```
 

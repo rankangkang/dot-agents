@@ -22,6 +22,7 @@ show_usage() {
   -n, --dry-run        预览变更，不执行实际操作
   -f, --force          强制修复指向错误的链接
   -c, --clean          仅清理悬空链接，不创建新链接
+  -u, --unlink         移除所有由 init 创建的符号链接
   -g, --global         链接到全局目录（$HOME）而非当前项目
   -t, --target <dir>   链接到指定目录
   -v, --verbose        显示详细调试信息
@@ -38,6 +39,7 @@ show_usage() {
   init.sh --force                强制修复所有错误链接
   init.sh --dry-run skills       预览 skills 链接变更
   init.sh --clean                清理所有悬空链接
+  init.sh --unlink               移除所有由 init 创建的符号链接
 EOF
 }
 
@@ -48,6 +50,7 @@ export FORCE=false
 export VERBOSE=false
 export QUIET=false
 CLEAN_ONLY=false
+UNLINK=false
 GLOBAL=false
 TARGET_DIR=""
 ASSET_TYPES=()
@@ -57,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         -n|--dry-run) DRY_RUN=true ;;
         -f|--force)   FORCE=true ;;
         -c|--clean)   CLEAN_ONLY=true ;;
+        -u|--unlink)  UNLINK=true ;;
         -g|--global)  GLOBAL=true ;;
         -t|--target)  [[ -z "${2:-}" || "$2" == -* ]] && { echo "--target 需要指定目录"; exit 1; }; TARGET_DIR="$2"; shift ;;
         -v|--verbose) VERBOSE=true ;;
@@ -67,6 +71,17 @@ while [[ $# -gt 0 ]]; do
     esac
     shift
 done
+
+# ── 互斥模式校验 ──
+
+_mode_count=0
+$CLEAN_ONLY && ((_mode_count++)) || true
+$UNLINK     && ((_mode_count++)) || true
+$FORCE      && ((_mode_count++)) || true
+if ((_mode_count > 1)); then
+    echo "--clean, --unlink, --force 互斥，不能同时使用"; exit 1
+fi
+unset _mode_count
 
 source "$SCRIPT_DIR/common.sh"
 
@@ -116,6 +131,7 @@ if ! $QUIET; then
     $DRY_RUN    && echo "  模式: 预览 (dry-run)"
     $FORCE      && echo "  模式: 强制修复 (force)"
     $CLEAN_ONLY && echo "  模式: 仅清理 (clean)"
+    $UNLINK     && echo "  模式: 移除链接 (unlink)"
     [[ "$TARGET_ROOT" != "$PROJECT_ROOT" ]] && echo "  目标: $TARGET_ROOT"
     echo "  工具: $TOOL_DIRS_STR"
     echo "  资产: ${ASSET_TYPES[*]}"
@@ -124,7 +140,25 @@ fi
 
 # ── 执行 ──
 
-if $CLEAN_ONLY; then
+if $UNLINK; then
+    if ! $QUIET; then
+        echo ""
+        echo -e "${BLUE}── 移除所有由 init 创建的链接 ──${NC}"
+    fi
+
+    reset_counts
+
+    read -ra _tool_dirs <<< "$TOOL_DIRS_STR"
+    for tool_dir in "${_tool_dirs[@]}"; do
+        [[ ! -d "$TARGET_ROOT/$tool_dir" ]] && continue
+        for asset_type in "${ASSET_TYPES[@]}"; do
+            purge_links "$asset_type" "$tool_dir" "$TARGET_ROOT" "$AGENTS_DIR"
+        done
+    done
+
+    echo ""
+    print_summary
+elif $CLEAN_ONLY; then
     if ! $QUIET; then
         echo ""
         echo -e "${BLUE}── 清理悬空链接 ──${NC}"
