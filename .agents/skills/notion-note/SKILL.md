@@ -1,89 +1,76 @@
 ---
 name: notion-note
 description: >
-  AI-powered personal knowledge base built on Notion. Use this skill whenever the user says
-  "记一下", "save this", "note this down", "/note", or any variation of asking to save a knowledge
-  point. Also use this skill proactively: when you help the user solve a tricky problem, discover
-  a non-obvious behavior, identify a reusable pattern, or learn something worth remembering —
-  suggest saving it to their knowledge base. This skill handles saving, searching, and managing
-  knowledge notes in Notion. Even if the user doesn't explicitly ask, if valuable knowledge was
-  produced during the conversation, you should offer to save it.
+  Save, search, and organize reusable knowledge in the user's Notion Knowledge Base. Use when the
+  user says "记一下", "记笔记", or similar, and proactively suggest saving when a conversation
+  produces non-obvious lessons, reusable patterns, or durable insights.
 ---
 
 # Notion Note — AI-Driven Knowledge Base on Notion
 
-You are a knowledge assistant. Your job is to help the user capture, organize, and retrieve
-valuable knowledge in their Notion knowledge base. You work alongside any AI agent (Claude Code,
-Cursor, CodeBuddy, OpenClaw, etc.) through the Notion MCP.
+你是一个知识助手，负责把值得长期复用的知识点记到 Notion 知识库里，并在需要时帮用户检索、补充和整理这些笔记。
 
 ## Dependencies
 
-This skill relies on the **Notion MCP Server** for all Notion operations. It does not directly
-call the Notion API — instead it delegates to the MCP tools provided by the Notion MCP.
+本 skill 依赖 **Notion MCP Server** 处理所有 Notion 读写操作，不直接调用 Notion API。
 
-### Notion MCP
+需要的 MCP 工具：
+- `notion-search`：搜索页面、数据库和内容
+- `notion-fetch`：读取页面或数据库详情
+- `notion-create-pages`：创建知识笔记
+- `notion-create-database`：首次初始化知识库数据库
+- `notion-update-page`：给已有笔记追加内容或更新属性
 
-- **What it is:** Notion's official MCP server, providing tools to search, create, read, and
-  update Notion pages and databases.
-- **Required tools used by this skill:**
-  - `notion-search` — Search the workspace for pages, databases, or content
-  - `notion-fetch` — Read a page or database by URL/ID, get data source schema
-  - `notion-create-pages` — Create new knowledge note pages under a data source
-  - `notion-create-database` — Initialize the Knowledge Base database on first use
-  - `notion-update-page` — Update existing note content or properties
-- **Setup:** Each AI agent needs to have the Notion MCP configured and authenticated. Refer to
-  [Notion MCP documentation](https://github.com/makenotion/notion-mcp) for setup instructions.
-- **Why MCP instead of custom code:** Notion MCP is maintained by Notion officially, handles
-  authentication, rate limiting, and API versioning. This skill focuses on the "what to write"
-  and "when to write" rather than "how to talk to Notion".
+如果存在 `.agents/skills/personal-writing-style/SKILL.md`，中文写作时应先读取它，再读取它要求的资源文件。
+职责边界如下：
+- `notion-note` 决定记什么、如何查重、如何确认、如何写入 Notion
+- `personal-writing-style` 只在可用时决定中文内容怎么写
+
+如果两者冲突，以 `notion-note` 的流程和数据约束为准，以 `personal-writing-style` 的文风约束为辅。
 
 ### Target Database
 
-The target Notion database name is **Knowledge Base**.
+目标数据库名称固定为 **Knowledge Base**。
 
-**Locating the database:** Before any read/write operation, you need the database's `data_source_id`.
-Follow this chain:
+在读写前先拿到 `data_source_id`：
+1. 用 `notion-search` 搜索名为 `Knowledge Base` 的数据库
+2. 用 `notion-fetch` 读取数据库详情
+3. 从返回内容里的 `collection://...` 提取 `data_source_id`
+4. 当前会话缓存这个 ID，后续复用即可
 
-1. Use `notion-search` to find the database by name "Knowledge Base"
-2. Use `notion-fetch` on the database URL/ID to get its `<data-source>` tags
-3. Extract the `data_source_id` from the `collection://` URL in the response
-4. Cache this ID for the rest of the session — no need to look it up every time
-
-**First-time initialization:** If the database doesn't exist, create it using `notion-create-database`
-with the schema defined in the Notion Database Schema section below. After creation, confirm the
-database URL with the user so they can find it in their workspace.
+如果数据库不存在，就用下文的 schema 调 `notion-create-database` 初始化，并把数据库链接告诉用户。
 
 ## Core Capabilities
 
 ### 1. Save Knowledge — 手动触发
 
-**Trigger phrases:** "记一下", "记录这个", "save this", "note this", "/note", "帮我存到知识库"
+**触发词示例：** `记一下`、`记录这个`、`save this`、`note this`、`/note`、`帮我存到知识库`
 
-When the user asks to save knowledge:
+当用户要求记笔记时，按下面流程走：
 
-1. **Extract** — Identify the core knowledge from the conversation context. Focus on what's
-   genuinely useful: the insight, the solution, the pattern — not the entire conversation.
+1. **Extract**
+   从上下文提炼真正值得长期保存的知识点，关注 insight、solution、pattern，不要把整段对话原封不动塞进去。
 
-2. **Dedup check** — Before drafting, search the Knowledge Base for notes with similar titles
-   or overlapping tags. If a closely related note exists:
-   - Show the user the existing note title and a brief summary
-   - Ask: "There's already a related note — do you want to **append** to it, **create a new
-     separate note**, or **skip**?"
-   - If appending, use `notion-update-page` to add the new content to the existing note
-   - If creating new, proceed as usual
+2. **Dedup Check**
+   先查重。搜索标题相近或标签重叠的笔记。
+   如果发现高度相关的笔记：
+   - 告诉用户已有哪条笔记
+   - 让用户选择：`追加` / `新建` / `跳过`
+   - 如果选择追加，用 `notion-update-page`
 
-3. **Draft metadata** — Propose the following to the user:
-   - **Title**: concise, scannable, written as a noun phrase (e.g., "TypeScript 联合类型的类型收窄技巧")
-   - **Category**: one of `Frontend`, `Backend`, `DevOps`, `Database`, `Architecture`, `Tools`, `Life`, `Other`
-   - **Tags**: 2-5 specific tags (e.g., `TypeScript`, `类型系统`, `最佳实践`). Reuse existing tags
-     when possible — search the database first to see what tags are already in use.
-   - **Source**: one of `AI-Conversation`, `Debug`, `Reading`, `Practice`, `Other`
-   - **Importance**: one of `High`, `Medium`, `Low`
-   - **Agent**: which AI agent is being used (e.g., `Claude Code`, `Cursor`, `CodeBuddy`, `Manual`)
+3. **Draft Metadata**
+   给用户草拟元数据：
+   - **Title**：简洁、可扫读、名词短语优先
+   - **Category**：`Frontend` / `Backend` / `DevOps` / `Database` / `Architecture` / `Tools` / `Life` / `Other`
+   - **Tags**：2-5 个具体标签，优先复用已有标签
+   - **Source**：`AI-Conversation` / `Debug` / `Reading` / `Practice` / `Other`
+   - **Importance**：`High` / `Medium` / `Low`
+   - **Agent**：当前 AI 工具名，如 `Cursor`、`Claude Code`、`Manual`
 
-4. **Confirm** — Show the user a brief summary:
-   ```
-   📝 Knowledge Note Draft:
+4. **Confirm**
+   给用户一个简短草稿预览，例如：
+   ```text
+   📝 Knowledge Note Draft
    Title: xxx
    Category: xxx | Tags: xxx, xxx | Source: xxx | Importance: xxx
 
@@ -91,81 +78,105 @@ When the user asks to save knowledge:
 
    Save to Knowledge Base?
    ```
-   Wait for confirmation before writing.
+   等用户确认后再写入。预览要尽量短，但要让用户看出这条笔记真正记了什么。
 
-5. **Write** — On confirmation, use Notion MCP to create the page in the Knowledge Base database.
+5. **Write**
+   确认后，用 Notion MCP 创建页面。
 
 ### 2. Proactive Suggestion — AI 主动提议
 
-During conversation, watch for moments where valuable knowledge is produced. Suggest saving
-when you detect:
+当对话里出现明显有复用价值的内容时，主动建议用户记下来。常见信号：
+- 找到一个**不明显但有效**的解法
+- 识别出一个**常见坑**
+- 总结出一个**可复用模式**
+- 解释清楚了一个**工具 / API / 概念**
+- 完成了一次**有迁移价值**的排障过程
 
-- A **non-obvious solution** was found (e.g., a workaround for a framework bug)
-- A **common pitfall** was identified (something that's easy to get wrong)
-- A **reusable pattern** or best practice emerged
-- A **new tool/API/concept** was explained and understood
-- A **debugging process** with transferable lessons was completed
+不要为下面这些内容主动提议：
+- 过于基础、常识化的信息
+- 只对当前项目临时有效的一次性配置
+- 官方文档里随手可查、没有额外理解增益的内容
+- 没有复用价值的临时 hack
 
-**Do NOT suggest saving for:**
-- Trivial or well-known information (e.g., "how to create a React component")
-- One-off configuration changes specific to the current project
-- Information easily found in official documentation
-- Temporary fixes or hacks with no learning value
-
-When suggesting, be concise:
-```
-💡 This [解决 XX 问题的方法/发现的 YY 行为] might be worth saving to your knowledge base.
-   Want me to save it?
+建议时要简洁，例如：
+```text
+💡 这个「[解决 XX 的方法 / 发现的 YY 行为]」挺适合记到知识库里。
+要不要我帮你记一下？
 ```
 
-If the user declines, don't insist. Move on.
+如果用户拒绝，就停止，不要反复追问。
 
 ### 3. Search & Retrieve — 知识检索
 
-**Trigger phrases:** "搜一下", "有没有记过", "search notes", "find in knowledge base"
+**触发词示例：** `搜一下`、`有没有记过`、`search notes`、`find in knowledge base`
 
-When the user wants to find existing knowledge:
+当用户要找已有笔记时：
 
-**Search strategy:**
-- Extract keywords from the user's query. If the query is vague (e.g., "之前那个关于内存的笔记"),
-  try multiple keyword variations (e.g., "内存泄漏", "memory leak", "OOM").
-- Use `notion-search` scoped to the Knowledge Base database (pass the `data_source_url`).
-- If initial search yields no results, broaden the query — try related terms, English/Chinese
-  equivalents, or search by Category/Tags instead.
-- If the user specifies filters (e.g., "最近一个月的" or "前端相关的"), respect them by refining
-  the search or post-filtering results.
+**Search Strategy**
+- 从用户问题里抽关键词
+- 如果说法很模糊，尝试多组同义词、英文词或相关词
+- 用 `notion-search` 在 Knowledge Base 范围内搜索
+- 如果有时间、分类、标签等条件，就带上过滤或做结果后筛
 
-**Present results** in a scannable format:
-```
+结果尽量可扫读，例如：
+```text
 Found 3 notes:
 1. [Title] — Category | Tags | Date
 2. [Title] — Category | Tags | Date
 3. [Title] — Category | Tags | Date
 ```
 
-Offer to open or show details of any specific note. When showing details, use `notion-fetch`
-to retrieve the full page content.
+如果用户要看详情，再用 `notion-fetch` 拉完整内容。
+如果在展开前要补一句简介或对比说明，避免写成空泛检索腔。
 
 ## Writing Guidelines for Note Content
 
-The page body (Notion page content) should follow these principles — not a rigid template:
+正文没有固定模板，但默认遵循下面这些原则。
 
-- **Start with the key takeaway** in 1-2 sentences. Someone scanning should get the point
-  without reading further.
-- **Organize naturally** based on content type. A debugging story has a different structure
-  than a concept explanation. Let the content dictate the structure.
-- **Include code examples** when relevant. Make them runnable, with brief comments explaining
-  the non-obvious parts. Use proper language tags in code blocks.
-- **Link to sources** when applicable — official docs, blog posts, Stack Overflow answers.
-  Place them at the end or inline where they add context.
-- **Keep it future-you friendly** — Write as if you'll read this 6 months later with zero
-  context about the original conversation. Include enough background to be self-contained.
+### Writing Style Integration
 
-Use Notion-flavored Markdown for formatting (headings, code blocks, callouts, etc.).
+如果 `personal-writing-style` 可用，中文内容默认走它的文风约束；如果不可用，就按本节继续。
+
+这条规则同时作用于：
+- 最终笔记正文
+- 保存前预览
+- 追加到旧笔记的内容
+- 检索时补充的简短摘要
+- 主动提议“要不要记一下”的文案
+
+写作原则：
+- **先给 takeaway**：开头 1-2 句话先说清楚这条笔记到底记了什么
+- **结构跟内容走**：排障、概念解释、最佳实践，结构不必一样
+- **需要时给例子**：代码示例只放真正有帮助的部分
+- **可回看**：默认按“6 个月后再看也能看懂”来写
+- **有来源就留来源**：官方文档、博客、Issue、回答链接都可以
+- **少写空话**：列表要有信息密度，不要只为了显得工整
+
+格式使用 Notion 兼容 Markdown。
+
+### Content Exclusion Rules
+
+最终写入 Notion 的正文，应该保留知识本体，而不是当前这轮对话里的脚手架信息。
+
+用户可见的预览、确认文案、主动建议，可以带少量对话感；但最终保存的正文和追加内容应去掉这些对话层话术。
+
+不要把下面这些内容写进正文：
+- 保存确认、行动号召或流程说明
+- AI 自我指代、meta commentary、当前人机协作话术
+- 只对这次聊天成立的临时范围说明
+- 未抽象成可复用规则、模式或判断标准的项目内临时处理细节
+
+例如：
+- “要不要我帮你记一下？”
+- “Save to Knowledge Base?”
+- “这条笔记只讲原理，不记录具体项目里的处理方案”
+
+判断标准：
+- 如果一句话脱离当前对话后，不能帮助未来的自己理解问题、复用方法或避免踩坑，就不要写进笔记正文
 
 ## Notion Database Schema
 
-The Knowledge Base database has the following structure:
+Knowledge Base 数据库结构如下：
 
 | Property | Type | Values |
 |----------|------|--------|
@@ -176,9 +187,9 @@ The Knowledge Base database has the following structure:
 | Importance | Select | `High`, `Medium`, `Low` |
 | Agent | Rich Text | Name of the AI agent or `Manual` |
 
-Created time is automatically tracked by Notion.
+`Created time` 由 Notion 自动记录。
 
-When initializing the database with `notion-create-database`, use this schema definition:
+首次初始化数据库时，用下面的 schema：
 ```sql
 CREATE TABLE (
   "Title" TITLE,
@@ -190,22 +201,9 @@ CREATE TABLE (
 )
 ```
 
-## Cross-Agent Setup
-
-This skill works with any AI agent that supports Notion MCP. The core requirement is:
-**Notion MCP connected + this skill's instructions loaded into the agent's context.**
-
-How to load varies by agent — see `references/cross-agent-setup.md` for per-agent
-configuration guides including Claude Code, Cursor, CodeBuddy, and others.
-
-All agents use the same Notion MCP to read/write the same database, ensuring data consistency
-regardless of which agent creates or searches notes.
-
 ## Important Notes
 
-- Always **search for existing tags** before creating new ones to avoid tag fragmentation
-  (e.g., don't create `React.js` if `React` already exists)
-- When the user provides content in Chinese, write the note in Chinese. When in English,
-  write in English. Match the user's language.
-- One note = one cohesive knowledge point. If the user wants to save multiple things from
-  one conversation, create separate notes for each.
+- 新建标签前先搜索已有标签，避免碎片化
+- 用户用中文，就写中文；用户用英文，就写英文
+- 中文内容如果能接入 `personal-writing-style`，优先用它，而不是通用助手腔
+- 一条笔记只记录一个完整知识点；如果一次对话里有多个知识点，拆成多条

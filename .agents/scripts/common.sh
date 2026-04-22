@@ -38,6 +38,7 @@ COUNT_WARN=0
 COUNT_ERROR=0
 COUNT_CLEAN=0
 COUNT_FIX=0
+COUNT_DRY=0
 
 # ── 日志 ──
 
@@ -49,13 +50,14 @@ log_error() { ((COUNT_ERROR++)) || true; echo -e "${RED}[ERROR]${NC} $1"; }
 log_clean() { ((COUNT_CLEAN++)) || true; echo -e "${YELLOW}[CLEAN]${NC} $1"; }
 log_info()  { if ! $QUIET; then echo -e "${BLUE}[INFO]${NC}  $1"; fi; }
 log_debug() { if $VERBOSE; then echo -e "${DIM}[DEBUG]${NC} $1"; fi; }
-log_dry()   { echo -e "${DIM}[DRY]${NC}   $1"; }
+log_dry()   { ((COUNT_DRY++))   || true; echo -e "${DIM}[DRY]${NC}   $1"; }
 
 print_summary() {
     local parts=()
     ((COUNT_OK    > 0)) && parts+=("${GREEN}${COUNT_OK} 创建${NC}")
     ((COUNT_FIX   > 0)) && parts+=("${GREEN}${COUNT_FIX} 修复${NC}")
     ((COUNT_CLEAN > 0)) && parts+=("${YELLOW}${COUNT_CLEAN} 清理${NC}")
+    ((COUNT_DRY   > 0)) && parts+=("${DIM}${COUNT_DRY} 预览${NC}")
     ((COUNT_SKIP  > 0)) && parts+=("${CYAN}${COUNT_SKIP} 跳过${NC}")
     ((COUNT_WARN  > 0)) && parts+=("${YELLOW}${COUNT_WARN} 警告${NC}")
     ((COUNT_ERROR > 0)) && parts+=("${RED}${COUNT_ERROR} 错误${NC}")
@@ -74,7 +76,7 @@ print_summary() {
 
 reset_counts() {
     COUNT_OK=0; COUNT_SKIP=0; COUNT_WARN=0
-    COUNT_ERROR=0; COUNT_CLEAN=0; COUNT_FIX=0
+    COUNT_ERROR=0; COUNT_CLEAN=0; COUNT_FIX=0; COUNT_DRY=0
 }
 
 # ── 配置加载 ──
@@ -174,6 +176,81 @@ get_relative_path() {
     fi
 
     _relpath_fallback "$source" "$target_dir"
+}
+
+resolve_link_path_lexically() {
+    local base_dir="$1"
+    local link_target="$2"
+
+    if command -v python3 &>/dev/null; then
+        python3 -c 'import os,sys; base=sys.argv[1]; target=sys.argv[2]; print(os.path.normpath(target if os.path.isabs(target) else os.path.join(base, target)))' \
+            "$base_dir" "$link_target"
+        return 0
+    fi
+
+    if command -v node &>/dev/null; then
+        node -e 'const path=require("path"); const base=process.argv[1]; const target=process.argv[2]; console.log(path.normalize(path.isAbsolute(target) ? target : path.join(base, target)))' \
+            "$base_dir" "$link_target"
+        return 0
+    fi
+
+    _resolve_link_path_fallback "$base_dir" "$link_target"
+}
+
+_resolve_link_path_fallback() {
+    local base_dir="$1"
+    local link_target="$2"
+    local combined
+
+    if [[ "$link_target" == /* ]]; then
+        combined="$link_target"
+    else
+        combined="$base_dir/$link_target"
+    fi
+
+    local absolute=false
+    [[ "$combined" == /* ]] && absolute=true
+
+    local IFS='/'
+    local -a parts=()
+    local -a stack=()
+    read -r -a parts <<< "$combined"
+
+    local part
+    for part in "${parts[@]}"; do
+        [[ -z "$part" || "$part" == "." ]] && continue
+
+        if [[ "$part" == ".." ]]; then
+            if [[ ${#stack[@]} -gt 0 && "${stack[${#stack[@]}-1]}" != ".." ]]; then
+                unset "stack[${#stack[@]}-1]"
+            elif ! $absolute; then
+                stack+=("$part")
+            fi
+            continue
+        fi
+
+        stack+=("$part")
+    done
+
+    local result=""
+    if $absolute; then
+        result="/"
+    fi
+
+    local idx
+    for idx in "${!stack[@]}"; do
+        if [[ -n "$result" && "$result" != "/" ]]; then
+            result+="/"
+        fi
+        result+="${stack[$idx]}"
+    done
+
+    if [[ -z "$result" ]]; then
+        $absolute && echo "/" || echo "."
+        return 0
+    fi
+
+    echo "$result"
 }
 
 _relpath_fallback() {
@@ -304,6 +381,53 @@ clean_stale_links() {
             log_clean "$display"
         fi
     done
+}
+
+# ── 清理所有由 init 创建的链接 ──
+
+purge_links() {
+    local item_type="$1"
+    local tool_dir="$2"
+    local project_root="$3"
+    local agents_dir="$4"
+
+    local target_dir="$project_root/$tool_dir/$item_type"
+    [[ ! -d "$target_dir" ]] && return 0
+
+    local agents_real
+    agents_real="$(cd "$agents_dir" && pwd -P)"
+
+    for entry in "$target_dir"/*; do
+        [[ "$entry" == "$target_dir/*" ]] && break
+        [[ ! -L "$entry" ]] && continue
+
+        local raw_target
+        raw_target=$(readlink "$entry") || continue
+
+        local link_dest
+        link_dest=$(resolve_link_path_lexically "$target_dir" "$raw_target") || continue
+
+        case "$link_dest" in
+            "$agents_real"|\
+            "$agents_real"/*)
+                local display="$tool_dir/$item_type/$(basename "$entry")"
+                if $DRY_RUN; then
+                    log_dry "移除 $display"
+                else
+                    rm "$entry"
+                    log_clean "$display"
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -d "$target_dir" ]] && ! $DRY_RUN; then
+        local remaining
+        remaining=$(ls -A "$target_dir" 2>/dev/null)
+        if [[ -z "$remaining" ]]; then
+            rmdir "$target_dir" 2>/dev/null && log_debug "移除空目录 $tool_dir/$item_type/"
+        fi
+    fi
 }
 
 # ── 初始化链接（主逻辑） ──
